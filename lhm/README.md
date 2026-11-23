@@ -30,6 +30,13 @@ uv run lhm --help
 ```
 
 Root is required for `apply` and `rollback`; `query`/`check` work unprivileged.
+Note: `sudo` resets `PATH` (`secure_path`), so `uv run sudo lhm ...` and
+`sudo uv run ...` both fail to find the binary. Invoke root commands as:
+
+```sh
+sudo .venv/bin/lhm apply updates     # project venv (uv sync)
+sudo "$(which lhm)" apply updates    # uv tool install / system install
+```
 
 ## Usage
 
