@@ -1,8 +1,10 @@
+import io
 import re
 from pathlib import Path
 
 import pytest
 
+from lhm.core import colors
 from lhm.core.files import (
     append_marked,
     render_shell_template,
@@ -117,3 +119,76 @@ def test_dropin_forced_mode_applies_to_new_file(tmp_path: Path) -> None:
     target = tmp_path / "new" / "secret.sh"
     write_dropin(target, "x\n", mode=0o700)
     assert target.stat().st_mode & 0o777 == 0o700
+
+
+def _capture(*, verbose: bool = False) -> io.StringIO:
+    stream = io.StringIO()
+    colors.configure("always", verbose=verbose)
+    colors.set_output(stream)
+    return stream
+
+
+def test_write_dropin_prints_created_symbol(tmp_path: Path) -> None:
+    stream = _capture()
+    target = tmp_path / "99-lhm.conf"
+    try:
+        write_dropin(target, "Port 22345\n")
+    finally:
+        colors.set_output(None)
+    assert stream.getvalue() == f"\033[32m+ {target}\033[0m\n"
+
+
+def test_write_dropin_prints_modified_symbol(tmp_path: Path) -> None:
+    target = tmp_path / "99-lhm.conf"
+    target.write_text("old\n", encoding="utf-8")
+    stream = _capture()
+    try:
+        write_dropin(target, "new\n")
+    finally:
+        colors.set_output(None)
+    assert stream.getvalue() == f"\033[33m~ {target}\033[0m\n"
+
+
+def test_write_dropin_skipped_prints_nothing(tmp_path: Path) -> None:
+    target = tmp_path / "99-lhm.conf"
+    target.write_text("same\n", encoding="utf-8")
+    stream = _capture()
+    try:
+        write_dropin(target, "same\n")
+    finally:
+        colors.set_output(None)
+    assert stream.getvalue() == ""
+
+
+def test_write_dropin_verbose_shows_diff(tmp_path: Path) -> None:
+    target = tmp_path / "99-lhm.conf"
+    target.write_text("keep\nold\n", encoding="utf-8")
+    stream = _capture(verbose=True)
+    try:
+        write_dropin(target, "keep\nnew\n")
+    finally:
+        colors.set_output(None)
+    out = stream.getvalue()
+    assert "\033[31m-old\033[0m" in out
+    assert "\033[32m+new\033[0m" in out
+
+
+def test_append_marked_prints_modified(tmp_path: Path) -> None:
+    target = tmp_path / "jail.local"
+    target.write_text("[DEFAULT]\n", encoding="utf-8")
+    stream = _capture()
+    try:
+        append_marked(target, "fail2ban", "enabled = true")
+    finally:
+        colors.set_output(None)
+    assert stream.getvalue().startswith(f"\033[33m~ {target}\033[0m\n")
+
+
+def test_append_marked_prints_created_for_missing_file(tmp_path: Path) -> None:
+    target = tmp_path / "new.conf"
+    stream = _capture()
+    try:
+        append_marked(target, "x", "body")
+    finally:
+        colors.set_output(None)
+    assert stream.getvalue().startswith(f"\033[32m+ {target}\033[0m\n")

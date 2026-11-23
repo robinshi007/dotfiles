@@ -60,7 +60,7 @@ lhm apply all --ssh-user NAME --key FILE --webhook URL --target PATH
                                 # ordered run, excludes cleanup-services
 lhm rollback FILE               # restore newest backup (double-confirmed)
 
-# globals: --dry-run --json --verbose
+# globals: --dry-run --json --verbose --color auto|always|never
 ```
 
 ### The six hardening goals
@@ -92,10 +92,33 @@ lhm rollback FILE               # restore newest backup (double-confirmed)
 hint. When applying manually, keep an existing SSH session open, and run
 `firewall` only after `ssh-hardening` reports its actual listen-port verify OK.
 
+## Colored output
+
+Color is decided by `src/lhm/core/colors.py` (the only module that knows ANSI
+codes). Default is `--color=auto`: color only when stdout is a TTY. `NO_COLOR`
+(any value) turns auto coloring off; an explicit `--color=always` wins over
+`NO_COLOR`, so piped output can be colored on purpose (`lhm query all
+--color=always | less -R`); `--color=never` disables it outright.
+
+- `query`: values are judged against lhm's hardening target — green = meets it,
+  red = does not, yellow = cannot be probed (e.g. `sshd -T` needs root).
+  `services` / `ports` / `system` have no target and stay uncolored.
+- `check`: the state column (OK green, needs-change red, UNKNOWN yellow).
+- `apply`: each executed command echoes as `$ cmd` in cyan; file changes print as
+  `+ created` (green), `~ modified` (yellow), `- deleted` (red) and
+  `@ symlink` (magenta). With `--verbose`, created/deleted changes print the full
+  content and modified ones a red/green unified diff.
+
+```sh
+lhm --color=always query all | less -R
+NO_COLOR=1 lhm check            # plain text
+lhm query ssh --color=never
+```
+
 ## Testing
 
 ```sh
-uv run pytest -q          # 185 unit tests, fake runner — no system calls
+uv run pytest -q          # 221 unit tests, fake runner — no system calls
 uv run ruff check
 cd integration && sudo ./run.sh   # docker-based integration suite (9 scenarios)
 ```

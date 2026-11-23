@@ -442,3 +442,21 @@ def test_ssh_user_reports_changed_when_dir_mode_wrong(
     results = ssh.apply_user(Runner(exec_fn=fake_exec), user="robin", key_file=str(key_file))
     names = {r.name: r.status for r in results}
     assert names["ensure " + str(ssh.authorized_keys_path("robin").parent)] is Status.CHANGED
+
+
+def test_rollback_delete_prints_red_minus(home: Path) -> None:
+    import io
+
+    from lhm.core import colors
+
+    ssh.SSHD_DROPIN.parent.mkdir(parents=True, exist_ok=True)
+    ssh.SSHD_DROPIN.write_text("Port 22345\n", encoding="utf-8")
+    stream = io.StringIO()
+    colors.configure("always")
+    colors.set_output(stream)
+    try:
+        assert ssh._rollback_dropin() == "removed the new drop-in"
+    finally:
+        colors.set_output(None)
+    assert stream.getvalue() == f"\033[31m- {ssh.SSHD_DROPIN}\033[0m\n"
+    assert not ssh.SSHD_DROPIN.exists()

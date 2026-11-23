@@ -7,6 +7,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from time import perf_counter
 
+from lhm.core import colors
+
 logger = logging.getLogger("lhm.runner")
 
 DEFAULT_TIMEOUT = 30.0
@@ -77,6 +79,9 @@ class Runner:
             return CommandResult(argv, 0, "", "", 0.0, was_dry_run=True)
 
         start = perf_counter()
+        if colors.enabled() or self.verbose:
+            # Echo only in color mode (TTY) or verbose: piped plain output stays clean.
+            colors.command(argv)
         completed = self.exec_fn(argv, timeout)
         duration = perf_counter() - start
         result = CommandResult(

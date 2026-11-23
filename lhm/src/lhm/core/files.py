@@ -8,6 +8,7 @@ from pathlib import Path
 from string import Template
 from typing import Literal
 
+from lhm.core import colors
 from lhm.core.backup import backup_file
 
 TEMPLATES_DIR = Path(__file__).resolve().parents[3] / "templates"
@@ -44,6 +45,13 @@ def _atomic_write(path: Path, content: str, mode: int | None = None) -> None:
         raise
 
 
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
 def write_dropin(path: str | Path, content: str, mode: int | None = None) -> WriteOutcome:
     """Write a drop-in atomically, skipping when content is already identical.
 
@@ -51,7 +59,8 @@ def write_dropin(path: str | Path, content: str, mode: int | None = None) -> Wri
     secret-bearing file never lands world-readable between write and chmod.
     """
     p = _checked_path(path)
-    if p.is_file() and p.read_text(encoding="utf-8") == content:
+    old = _read_text(p) if p.is_file() else None
+    if old == content:
         return "skipped"
     backup: Path | None = None
     if p.exists() or p.is_symlink():
@@ -59,6 +68,7 @@ def write_dropin(path: str | Path, content: str, mode: int | None = None) -> Wri
     _atomic_write(p, content, mode)
     if mode is not None and backup is not None:
         os.chmod(backup, mode)
+    colors.file_change("created" if old is None else "modified", p, old=old, new=content)
     return "written"
 
 
@@ -92,6 +102,12 @@ def append_marked(path: str | Path, marker: str, content: str) -> AppendOutcome:
     if p.exists() or p.is_symlink():
         backup_file(p)
     _atomic_write(p, updated)
+    colors.file_change(
+        "modified" if existing else "created",
+        p,
+        old=existing or None,
+        new=updated,
+    )
     return "appended"
 
 

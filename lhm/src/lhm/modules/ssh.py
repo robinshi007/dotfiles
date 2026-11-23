@@ -8,7 +8,7 @@ import struct
 from collections.abc import Sequence
 from pathlib import Path
 
-from lhm.core import checks
+from lhm.core import checks, colors
 from lhm.core.backup import newest_backup, rollback_file
 from lhm.core.confirm import confirm_twice
 from lhm.core.files import render_template, write_dropin
@@ -273,7 +273,10 @@ def _rollback_dropin() -> str:
     if backup is not None:
         rollback_file(SSHD_DROPIN)
         return f"restored {backup.name}"
+    old = _read_text(SSHD_DROPIN)
     SSHD_DROPIN.unlink(missing_ok=True)
+    if old is not None:
+        colors.file_change("deleted", SSHD_DROPIN, old=old)
     return "removed the new drop-in"
 
 

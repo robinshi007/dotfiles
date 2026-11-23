@@ -5,6 +5,7 @@ from collections.abc import Iterable
 
 import pytest
 
+from lhm.core import colors
 from lhm.core.runner import Runner
 
 
@@ -24,6 +25,16 @@ class FakeExec:
             if joined.startswith(prefix):
                 return subprocess.CompletedProcess(cmd, rc, out, err)
         return subprocess.CompletedProcess(cmd, 0, "", "")
+
+
+@pytest.fixture(autouse=True)
+def _reset_colors() -> Iterable[None]:
+    """Keep the module-level color policy from leaking between tests."""
+    colors.configure("auto", verbose=False)
+    colors.set_output(None)
+    yield
+    colors.configure("auto", verbose=False)
+    colors.set_output(None)
 
 
 @pytest.fixture

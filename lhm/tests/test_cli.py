@@ -299,3 +299,126 @@ def test_query_ssh_with_effective_config_shows_values(
     assert "22345" in out
     assert "needs root" not in out
     assert out.count("unavailable") == 4
+
+
+SSHD_HARDENED = (
+    "port 22345\n"
+    "permitrootlogin no\n"
+    "passwordauthentication no\n"
+    "kbdinteractiveauthentication no\n"
+    "pubkeyauthentication yes\n"
+    "x11forwarding no\n"
+    "maxauthtries 3\n"
+)
+
+
+def test_query_ssh_hardened_values_are_green(
+    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from lhm.core.colors import Color
+    from lhm.modules import ssh
+
+    monkeypatch.setattr(ssh, "HOME_ROOT", Path("/nonexistent"))
+    fake_exec.responses.append(("sshd -T", 0, SSHD_HARDENED, ""))
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    assert cli.main(["query", "ssh", "--color=always"]) == 0
+    out = capsys.readouterr().out
+    for value in ("22345", "no", "yes", "3"):
+        assert f"{Color.GREEN}{value}{Color.RESET}" in out
+
+
+def test_query_ssh_weak_values_are_red(
+    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from lhm.core.colors import Color
+    from lhm.modules import ssh
+
+    monkeypatch.setattr(ssh, "HOME_ROOT", Path("/nonexistent"))
+    fake_exec.responses.append(
+        (
+            "sshd -T",
+            0,
+            "port 22\npermitrootlogin yes\npasswordauthentication yes\n"
+            "pubkeyauthentication yes\nmaxauthtries 6\n",
+            "",
+        )
+    )
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    assert cli.main(["query", "ssh", "--color=always"]) == 0
+    out = capsys.readouterr().out
+    assert f"{Color.RED}22{Color.RESET}" in out
+    assert f"{Color.RED}yes{Color.RESET}" in out
+    assert f"{Color.RED}6{Color.RESET}" in out
+
+
+def test_query_ssh_probe_failure_rows_are_yellow(
+    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from lhm.core.colors import Color
+    from lhm.modules import ssh
+
+    monkeypatch.setattr(ssh, "HOME_ROOT", Path("/nonexistent"))
+    fake_exec.responses.append(("sshd -T", 1, "", "permission denied"))
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    assert cli.main(["query", "ssh", "--color=always"]) == 0
+    out = capsys.readouterr().out
+    assert out.count(Color.YELLOW) == 7
+
+
+def test_query_all_without_tty_emits_no_ansi(
+    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    assert cli.main(["query", "all"]) == 0
+    assert "\033[" not in capsys.readouterr().out
+
+
+def test_color_always_overrides_no_tty_and_no_color(
+    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    assert cli.main(["query", "system", "--color=always"]) == 0
+    # system has no judged cells, so force a check run instead: still no codes...
+    capsys.readouterr()
+    assert cli.main(["check", "--color=always"]) == 0
+    assert "\033[" in capsys.readouterr().out
+
+
+def test_color_never_on_a_tty(
+    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    assert cli.main(["check", "--color=never"]) == 0
+    assert "\033[" not in capsys.readouterr().out
+
+
+def test_check_status_column_is_colored(
+    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from lhm.core.colors import Color
+
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    monkeypatch.setattr(
+        cli,
+        "CHECKERS",
+        {module.name: (lambda runner: (True, "fine")) for module in cli.MODULES}
+        | {"ssh": lambda runner: (False, "weak")},
+    )
+    assert cli.main(["check", "--color=always"]) == 0
+    out = capsys.readouterr().out
+    assert f"{Color.GREEN}OK" in out
+    assert f"{Color.RED}needs-change{Color.RESET}" in out
+
+
+def test_json_output_stays_pure_even_with_forced_color(
+    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    assert cli.main(["query", "ssh", "--json", "--color=always"]) == 0
+    out = capsys.readouterr().out
+    assert "\033[" not in out
+    json.loads(out)

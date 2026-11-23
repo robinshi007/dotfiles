@@ -57,3 +57,34 @@ def test_commands_are_logged(fake_exec: Any, caplog: pytest.LogCaptureFixture) -
     assert "cmd=true" in caplog.text
     assert "rc=0" in caplog.text
     assert "duration=" in caplog.text
+
+
+def test_executed_command_is_echoed_in_color_mode(fake_exec: Any) -> None:
+    import io
+
+    from lhm.core import colors
+
+    stream = io.StringIO()
+    stream.isatty = lambda: True  # type: ignore[method-assign]
+    colors.configure("always")
+    colors.set_output(stream)
+    try:
+        Runner(exec_fn=fake_exec).run(["systemctl", "restart", "ssh"])
+    finally:
+        colors.set_output(None)
+    assert "$ systemctl restart ssh" in stream.getvalue()
+
+
+def test_dry_run_echoes_no_command(fake_exec: Any) -> None:
+    import io
+
+    from lhm.core import colors
+
+    stream = io.StringIO()
+    colors.configure("always")
+    colors.set_output(stream)
+    try:
+        Runner(dry_run=True, exec_fn=fake_exec).run(["systemctl", "restart", "ssh"])
+    finally:
+        colors.set_output(None)
+    assert stream.getvalue() == ""

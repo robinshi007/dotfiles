@@ -137,3 +137,22 @@ def test_restart_failure_restores_existing_dropin(
     assert restart.status is Status.FAIL
     assert "restored" in restart.detail
     assert path.read_text(encoding="utf-8") == "# old sandbox\n"
+
+
+def test_rollback_delete_prints_red_minus(unit_dir: Path) -> None:
+    import io
+
+    from lhm.core import colors
+
+    path = unit_dir / "ssh.service.d" / "99-lhm-sandbox.conf"
+    path.parent.mkdir(parents=True)
+    path.write_text("[Service]\n", encoding="utf-8")
+    stream = io.StringIO()
+    colors.configure("always")
+    colors.set_output(stream)
+    try:
+        assert sandbox._rollback_dropin("ssh") == "removed the new drop-in"
+    finally:
+        colors.set_output(None)
+    assert stream.getvalue() == f"\033[31m- {path}\033[0m\n"
+    assert not path.exists()

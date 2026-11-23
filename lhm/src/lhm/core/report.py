@@ -5,6 +5,12 @@ from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 
+from lhm.core import colors
+from lhm.core.colors import Color
+
+# A row color is either one color for the whole row or one color per cell.
+RowColor = Color | Sequence[Color | None] | None
+
 
 class Status(StrEnum):
     OK = "OK"
@@ -21,7 +27,17 @@ class StepResult:
     detail: str = ""
 
 
-def render_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
+def _cell_color(row_color: RowColor, index: int) -> Color | None:
+    if row_color is None or isinstance(row_color, Color):
+        return row_color
+    return row_color[index] if index < len(row_color) else None
+
+
+def render_table(
+    headers: Sequence[str],
+    rows: Sequence[Sequence[str]],
+    row_colors: Sequence[RowColor] | None = None,
+) -> str:
     columns = len(headers)
     widths = [len(h) for h in headers]
     for row in rows:
@@ -31,10 +47,26 @@ def render_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
         "  ".join(str(h).ljust(widths[i]) for i, h in enumerate(headers)).rstrip(),
         "  ".join("-" * widths[i] for i in range(columns)),
     ]
-    for row in rows:
-        lines.append(
-            "  ".join(str(row[i]).ljust(widths[i]) for i in range(columns)).rstrip()
+    for row_index, row in enumerate(rows):
+        row_color = (
+            row_colors[row_index]
+            if row_colors is not None and row_index < len(row_colors)
+            else None
         )
+        if row_color is None:
+            lines.append(
+                "  ".join(str(row[i]).ljust(widths[i]) for i in range(columns)).rstrip()
+            )
+            continue
+        # The last cell is printed unpadded; the others keep their width so the
+        # (invisible) padding inside an escape sequence cannot break alignment.
+        cells = []
+        for index in range(columns):
+            text = str(row[index])
+            if index < columns - 1:
+                text = text.ljust(widths[index])
+            cells.append(colors.paint(text, _cell_color(row_color, index)))
+        lines.append("  ".join(cells))
     return "\n".join(lines)
 
 
@@ -44,12 +76,13 @@ def print_table(
     *,
     as_json: bool = False,
     payload: object | None = None,
+    row_colors: Sequence[RowColor] | None = None,
 ) -> None:
     if as_json:
         print(json.dumps(payload if payload is not None else rows, indent=2, default=str))
         return
     if rows:
-        print(render_table(headers, rows))
+        print(render_table(headers, rows, row_colors))
     else:
         print("(no data)")
 

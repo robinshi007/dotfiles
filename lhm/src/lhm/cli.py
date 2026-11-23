@@ -10,11 +10,12 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
-from lhm.core import checks
+from lhm.core import checks, colors
 from lhm.core.backup import backup_file, newest_backup, rollback_file
+from lhm.core.colors import Color
 from lhm.core.confirm import confirm_twice, is_root
 from lhm.core.distro import DistroError
-from lhm.core.report import Status, print_json, print_steps, print_table
+from lhm.core.report import RowColor, Status, print_json, print_steps, print_table
 from lhm.core.runner import CommandError, Runner
 from lhm.modules import APPLY_ALL_ORDER, MODULES, resolve
 from lhm.modules import alert as alert_module
@@ -33,6 +34,8 @@ EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_USAGE = 2
 
+QueryTable = tuple[list[str], list[list[str]], dict[str, Any], list[RowColor]]
+
 QUERY_TARGETS = (
     "system", "ssh", "firewall", "services", "ports", "sysctl", "audit", "updates", "all",
 )
@@ -47,7 +50,16 @@ def _add_global_flags(parser: argparse.ArgumentParser, *, suppress: bool = False
         "--json", action="store_true", default=default, help="machine-readable output"
     )
     parser.add_argument(
-        "--verbose", action="store_true", default=default, help="log every command"
+        "--verbose",
+        action="store_true",
+        default=default,
+        help="log every command and show full change content",
+    )
+    parser.add_argument(
+        "--color",
+        choices=colors.MODES,
+        default=argparse.SUPPRESS if suppress else "auto",
+        help="colorize output: auto (TTY only), always, never (NO_COLOR=1 disables auto)",
     )
 
 
@@ -179,7 +191,38 @@ def _flag(value: bool | None) -> str:
     return "unknown" if value is None else ("yes" if value else "no")
 
 
-def _query_system() -> tuple[list[str], list[list[str]], dict[str, Any]]:
+def _judge(ok: bool | None) -> Color:
+    """Green when the target is met, red when it is not, yellow when unprobeable."""
+    if ok is None:
+        return Color.YELLOW
+    return Color.GREEN if ok else Color.RED
+
+
+# sshd setting -> callable deciding whether the effective value meets the target.
+SSHD_TARGETS: dict[str, Callable[[str], bool | None]] = {
+    "port": lambda value: value == "22345",
+    "permitrootlogin": lambda value: value == "no",
+    "passwordauthentication": lambda value: value == "no",
+    "kbdinteractiveauthentication": lambda value: value == "no",
+    "pubkeyauthentication": lambda value: value == "yes",
+    "x11forwarding": lambda value: value == "no",
+    "maxauthtries": lambda value: value.isdigit() and int(value) <= 3,
+}
+
+# Judged sysctl keys and their targets: every key the module's template sets.
+def _sysctl_targets() -> dict[str, str]:
+    targets: dict[str, str] = {}
+    for line in sysctl_module.desired_conf().splitlines():
+        key, sep, value = line.partition("=")
+        if sep and not key.lstrip().startswith("#"):
+            targets[key.strip()] = value.strip()
+    return targets
+
+
+SYSCTL_TARGETS = _sysctl_targets()
+
+
+def _query_system() -> QueryTable:
     release: dict[str, str] = {}
     try:
         for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
@@ -198,10 +241,10 @@ def _query_system() -> tuple[list[str], list[list[str]], dict[str, Any]]:
         "root": is_root(),
     }
     rows = [[key, str(value)] for key, value in info.items()]
-    return ["key", "value"], rows, info
+    return ["key", "value"], rows, info, []
 
 
-def _query_ssh(runner: Runner) -> tuple[list[str], list[list[str]], dict[str, Any]]:
+def _query_ssh(runner: Runner) -> QueryTable:
     state = ssh_module.inspect(runner)
     config = checks.sshd_effective_config(runner)
     keys = (
@@ -213,6 +256,10 @@ def _query_ssh(runner: Runner) -> tuple[list[str], list[list[str]], dict[str, An
         "x11forwarding",
         "maxauthtries",
     )
+    dropin_color: RowColor = [
+        None,
+        Color.GREEN if state["dropin_current"] else Color.RED,
+    ]
     if not config:
         # sshd -T reads every included file and fails without root when any of
         # them is root-only (e.g. 50-cloud-init.conf). Distinguish "cannot
@@ -222,25 +269,38 @@ def _query_ssh(runner: Runner) -> tuple[list[str], list[list[str]], dict[str, An
             "note": "sshd -T failed (try: sudo lhm query ssh)",
         }
         rows = [[key, "unavailable (needs root)"] for key in keys]
+        row_colors: list[RowColor] = [[None, Color.YELLOW] for _ in keys]
         rows.append(["99-lhm drop-in", "current" if state["dropin_current"] else "differs"])
+        row_colors.append(dropin_color)
         rows.append(["authorized users", " ".join(state["authorized_users"]) or "-"])
+        row_colors.append(None)
         rows.append(["hint", "run: sudo lhm query ssh"])
-        return ["setting", "effective value"], rows, payload
+        row_colors.append(None)
+        return ["setting", "effective value"], rows, payload, row_colors
     payload = {key: config.get(key, "unavailable") for key in keys}
     payload["dropin"] = state["dropin"]
     payload["dropin_current"] = state["dropin_current"]
     payload["authorized_users"] = state["authorized_users"]
     rows = [[key, payload[key]] for key in keys]
+    row_colors = []
+    for key in keys:
+        value = payload[key]
+        ok = None if value == "unavailable" else SSHD_TARGETS[key](value)
+        row_colors.append([None, _judge(ok)])
     rows.append(["99-lhm drop-in", "current" if state["dropin_current"] else "differs"])
+    row_colors.append(dropin_color)
     rows.append(["authorized users", " ".join(state["authorized_users"]) or "-"])
-    return ["setting", "effective value"], rows, payload
+    row_colors.append(None)
+    return ["setting", "effective value"], rows, payload, row_colors
 
 
-def _query_firewall(runner: Runner) -> tuple[list[str], list[list[str]], dict[str, Any]]:
+def _query_firewall(
+    runner: Runner,
+) -> QueryTable:
     status = checks.ufw_status(runner)
     if status is None:
         payload: dict[str, Any] = {"available": False, "note": "not configured by lhm"}
-        return ["key", "value"], [["status", "unavailable"]], payload
+        return ["key", "value"], [["status", "unavailable"]], payload, [[None, Color.YELLOW]]
     payload = {
         "available": True,
         "active": status.active,
@@ -253,12 +313,20 @@ def _query_firewall(runner: Runner) -> tuple[list[str], list[list[str]], dict[st
         ["default incoming", status.default_incoming or "-"],
         ["default outgoing", status.default_outgoing or "-"],
     ]
+    row_colors: list[RowColor] = [
+        [None, Color.GREEN if status.active else Color.RED],
+        [None, Color.GREEN if status.default_incoming == "deny" else Color.RED],
+        None,
+    ]
     for rule in status.rules:
         rows.append([f"rule {rule.to}", f"{rule.action} from {rule.source or 'anywhere'}"])
-    return ["key", "value"], rows, payload
+        row_colors.append(None)
+    return ["key", "value"], rows, payload, row_colors
 
 
-def _query_services(runner: Runner) -> tuple[list[str], list[list[str]], dict[str, Any]]:
+def _query_services(
+    runner: Runner,
+) -> QueryTable:
     states = [checks.probe_service(runner, name) for name in checks.SERVICES]
     listing = services_module.inspect(runner)
     essential = [
@@ -275,10 +343,10 @@ def _query_services(runner: Runner) -> tuple[list[str], list[list[str]], dict[st
         "essential": essential,
         "cleanup_candidates": listing["candidates"],
     }
-    return ["service", "active", "enabled", "present"], rows, payload
+    return ["service", "active", "enabled", "present"], rows, payload, []
 
 
-def _query_ports(runner: Runner) -> tuple[list[str], list[list[str]], dict[str, Any]]:
+def _query_ports(runner: Runner) -> QueryTable:
     records = checks.listening_ports(runner)
     payload = [
         {
@@ -291,19 +359,27 @@ def _query_ports(runner: Runner) -> tuple[list[str], list[list[str]], dict[str, 
         for r in records
     ]
     rows = [[r.proto, r.address, str(r.port or ""), r.state, r.process or "-"] for r in records]
-    return ["proto", "address", "port", "state", "process"], rows, payload
+    return ["proto", "address", "port", "state", "process"], rows, payload, []
 
 
-def _query_sysctl() -> tuple[list[str], list[list[str]], dict[str, Any]]:
+def _query_sysctl() -> QueryTable:
     payload = {key: checks.sysctl_value(key) for key in checks.SYSCTL_KEYS}
     rows = [[key, value if value is not None else "unavailable"] for key, value in payload.items()]
+    row_colors: list[RowColor] = []
+    for key, value in payload.items():
+        want = SYSCTL_TARGETS.get(key)
+        if want is None:
+            row_colors.append(None)
+            continue
+        row_colors.append([None, _judge(None if value is None else value == want)])
     spot = sysctl_module.inspect()
     rows.append(["99-lhm drop-in", "current" if spot["dropin_current"] else "differs"])
+    row_colors.append([None, Color.GREEN if spot["dropin_current"] else Color.RED])
     payload["dropin_current"] = spot["dropin_current"]
-    return ["key", "value"], rows, payload
+    return ["key", "value"], rows, payload, row_colors
 
 
-def _query_audit(runner: Runner) -> tuple[list[str], list[list[str]], dict[str, Any]]:
+def _query_audit(runner: Runner) -> QueryTable:
     state = audit_module.inspect(runner)
     payload = {
         "auditd_active": state["active"],
@@ -318,30 +394,57 @@ def _query_audit(runner: Runner) -> tuple[list[str], list[list[str]], dict[str, 
         ["99-lhm rules current", "yes" if state["rules_current"] else "no"],
         ["rules immutable (-e 2)", _flag(bool(state["immutable"]))],
     ]
+    row_colors: list[RowColor] = [
+        [None, _judge(None if state["active"] is None else bool(state["active"]))],
+        [None, _judge(None if state["installed"] is None else bool(state["installed"]))],
+        [None, _judge(bool(state["rules_current"]))],
+        None,
+    ]
     for line in str(state["auditctl_status"]).splitlines():
         key, _, value = line.partition(" ")
         rows.append([f"auditctl {key}", value.strip() or "-"])
+        row_colors.append(None)
     if not state["auditctl_status"]:
         rows.append(["auditctl -s", "unavailable"])
-    return ["key", "value"], rows, payload
+        row_colors.append([None, Color.YELLOW])
+    return ["key", "value"], rows, payload, row_colors
 
 
-def _query_updates(runner: Runner) -> tuple[list[str], list[list[str]], dict[str, Any]]:
+def _query_updates(
+    runner: Runner,
+) -> QueryTable:
     try:
         payload = updates_module.inspect(runner)
     except DistroError as exc:
         payload = {"package": updates_module.PACKAGE, "installed": None, "error": str(exc)}
-        return ["key", "value"], [["status", "unavailable"], ["reason", str(exc)]], payload
+        return (
+            ["key", "value"],
+            [["status", "unavailable"], ["reason", str(exc)]],
+            payload,
+            [[None, Color.YELLOW], None],
+        )
+    active = checks.probe_service(runner, updates_module.PACKAGE).active
+    installed = payload["installed"]
+    conf_current = bool(payload["apt_conf_current"])
     rows = [
-        ["unattended-upgrades installed", _flag(payload["installed"])],
-        ["51-lhm current", "yes" if payload["apt_conf_current"] else "no"],
+        ["unattended-upgrades installed", _flag(installed)],
+        ["unattended-upgrades active", _flag(active)],
+        ["51-lhm current", "yes" if conf_current else "no"],
         ["51-lhm path", str(payload["apt_conf"])],
     ]
-    return ["key", "value"], rows, payload
+    row_colors: list[RowColor] = [
+        [None, _judge(None if installed is None else bool(installed))],
+        [None, _judge(active)],
+        [None, Color.GREEN if conf_current else Color.RED],
+        None,
+    ]
+    return ["key", "value"], rows, payload, row_colors
 
 
 def _handle_query(args: argparse.Namespace, runner: Runner, as_json: bool) -> int:
-    builders: dict[str, Callable[[], tuple[list[str], list[list[str]], dict[str, Any]]]] = {
+    builders: dict[
+        str, Callable[[], QueryTable]
+    ] = {
         "system": _query_system,
         "ssh": lambda: _query_ssh(runner),
         "firewall": lambda: _query_firewall(runner),
@@ -353,21 +456,23 @@ def _handle_query(args: argparse.Namespace, runner: Runner, as_json: bool) -> in
     }
     if args.target == "all":
         return _query_all(runner, builders, as_json)
-    headers, rows, payload = builders[args.target]()
-    print_table(headers, rows, as_json=as_json, payload=payload)
+    headers, rows, payload, row_colors = builders[args.target]()
+    print_table(headers, rows, as_json=as_json, payload=payload, row_colors=row_colors)
     return EXIT_OK
 
 
 def _query_all(
     runner: Runner,
-    builders: dict[str, Callable[[], tuple[list[str], list[list[str]], dict[str, Any]]]],
+    builders: dict[
+        str, Callable[[], QueryTable]
+    ],
     as_json: bool,
 ) -> int:
     """Print every query section in order, separated by == name == headers."""
     sections: dict[str, object] = {}
     if as_json:
         for name, build in builders.items():
-            _headers, _rows, payload = build()
+            _headers, _rows, payload, _row_colors = build()
             sections[name] = payload
         print(json.dumps(sections, indent=2, sort_keys=True))
         return EXIT_OK
@@ -377,8 +482,8 @@ def _query_all(
             print()
         first = False
         print(f"== {name} ==")
-        headers, rows, payload = build()
-        print_table(headers, rows, as_json=False)
+        headers, rows, payload, row_colors = build()
+        print_table(headers, rows, as_json=False, row_colors=row_colors)
     return EXIT_OK
 
 
@@ -525,20 +630,24 @@ CHECKERS = {
 
 def _handle_check(args: argparse.Namespace, runner: Runner, as_json: bool) -> int:
     rows = []
+    row_colors: list[RowColor] = []
     for module in MODULES:
         checker = CHECKERS.get(module.name)
         if checker is None:
             if module.name == "services":
                 rows.append([module.name, "manual", "interactive: apply cleanup-services"])
+                row_colors.append(None)
             else:
                 rows.append([module.name, "UNKNOWN", "not implemented"])
+                row_colors.append([None, Color.YELLOW])
             continue
         ok, detail = checker(runner)
         rows.append([module.name, "OK" if ok else "needs-change", detail])
+        row_colors.append([None, Color.GREEN if ok else Color.RED])
     if as_json:
         print_json([{"area": a, "state": s, "detail": d} for a, s, d in rows])
     else:
-        print_table(["area", "state", "detail"], rows)
+        print_table(["area", "state", "detail"], rows, row_colors=row_colors)
     return EXIT_OK
 
 
@@ -711,6 +820,10 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
+    )
+    # --json stays machine-readable: no command echo or change lines mixed in.
+    colors.configure(
+        getattr(args, "color", "auto"), verbose=bool(args.verbose), quiet=as_json
     )
     runner = Runner(dry_run=bool(args.dry_run), verbose=bool(args.verbose))
     try:

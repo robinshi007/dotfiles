@@ -4,6 +4,7 @@ import re
 from collections.abc import Sequence
 from pathlib import Path
 
+from lhm.core import colors
 from lhm.core.backup import newest_backup, rollback_file
 from lhm.core.confirm import confirm_twice
 from lhm.core.files import write_dropin
@@ -236,7 +237,12 @@ def _rollback_dropin(service: str) -> str:
         rollback_file(path)
         return f"restored {backup.name}"
     if path.exists():
+        try:
+            old = path.read_text(encoding="utf-8")
+        except OSError:
+            old = None
         path.unlink()
+        colors.file_change("deleted", path, old=old)
         return "removed the new drop-in"
     return "no drop-in to roll back"
 
