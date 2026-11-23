@@ -41,7 +41,7 @@ sudo "$(which lhm)" apply updates    # uv tool install / system install
 ## Usage
 
 ```sh
-lhm query system|ssh|firewall|services|ports|sysctl|audit|updates [--json]
+lhm query system|ssh|firewall|fail2ban|services|ports|sysctl|audit|updates [--json]
 lhm query all                   # every section, == name == separators
 lhm check                       # idempotency audit across all 11 areas
 
@@ -49,7 +49,7 @@ lhm apply updates [--security-only]
 lhm apply ssh-user NAME --key FILE [--sudo]
 lhm apply ssh-hardening [--port 22345] [--allow-user NAME]...
 lhm apply firewall [--allow PORT/PROTO]...
-lhm apply fail2ban [--bantime 1h --findtime 10m --maxretry 5]
+lhm apply fail2ban [--bantime 8h --findtime 30m --maxretry 3] [--caddy]
 lhm apply cleanup-services      # interactive: pick services/ports to disable
 lhm apply sysctl
 lhm apply sandbox [ssh|nginx|fail2ban]...
@@ -73,10 +73,23 @@ lhm rollback FILE               # restore newest backup (double-confirmed)
    socket-activated `ssh.socket`; verifies the *actual* listening port.
 3. `firewall` — ufw: allow the current SSH port(s) and 22345/tcp *first*, then
    `default deny incoming`, `allow outgoing`, enable.
-4. `fail2ban` — installs fail2ban + nftables (only a Recommends upstream!),
-   `jail.local` with the sshd jail on port 22345; `cleanup-services` lists
-   listening ports/enabled services (protected set excluded) for interactive
-   disable.
+4. `fail2ban` — installs fail2ban + nftables (only a Recommends upstream!) and
+   writes a **`jail.d/99-lhm.local` drop-in** with the sshd jail on port 22345.
+   It never touches `/etc/fail2ban/jail.local`: load order is
+   `jail.conf` → `jail.d/*.conf` → `jail.local` → `jail.d/*.local`, so the
+   drop-in wins over a hand-maintained `jail.local`, which keeps the host's own
+   custom jails intact. sshd jail: `mode = aggressive`, `maxretry = 3`,
+   `findtime = 30m`, `bantime = 8h` with incrementing bans
+   (`bantime.increment`, `factor = 3`, `maxtime = 4w`, `rndtime = 30m`), i.e.
+   bantime · 2^n · 3 capped at 4 weeks — 8h, 48h, 4d, 8d, 16d, then 4w. The
+   increment needs fail2ban's dbfile (packaging default
+   `/var/lib/fail2ban/fail2ban.sqlite3`). `--caddy` also installs the
+   lhm-provided `filter.d/caddy-lhm.conf` (fail2ban has no Caddy filter and no
+   JSON parser) and enables a journald-based caddy jail on ports 80,443 for
+   401/403/404/429 responses; caddy is **off by default** because an enabled jail
+   for a missing `caddy.service` stops fail2ban from starting. `cleanup-services`
+   lists listening ports/enabled services (protected set excluded) for
+   interactive disable.
 5. `sysctl` / `sandbox` — hardened sysctl drop-in (`kptr_restrict`,
    `dmesg_restrict`, `rp_filter`, ...); systemd sandbox drop-ins for a fixed
    whitelist (ssh, nginx, fail2ban) with per-service exceptions and automatic
@@ -118,7 +131,7 @@ lhm query ssh --color=never
 ## Testing
 
 ```sh
-uv run pytest -q          # 221 unit tests, fake runner — no system calls
+uv run pytest -q          # 244 unit tests, fake runner — no system calls
 uv run ruff check
 cd integration && sudo ./run.sh   # docker-based integration suite (9 scenarios)
 ```
@@ -136,8 +149,9 @@ src/lhm/cli.py            argparse assembly, exit codes
 src/lhm/core/             runner / confirm / backup / files / distro / checks / report
 src/lhm/modules/          updates, ssh, firewall, fail2ban, services, sysctl,
                            sandbox, logging, audit, alert, backup
-templates/                sshd, sysctl, jail.local, audit rules, journald,
-                           logrotate, alert + backup timers/scripts
+templates/                sshd, sysctl, fail2ban (99-lhm.local + caddy filter),
+                           audit rules, journald, logrotate, alert + backup
+                           timers/scripts
 integration/              Dockerfile, run.sh, scenarios/01-09
 DESIGN.md                 authoritative design (safety rules §Safety)
 ```

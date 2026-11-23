@@ -37,7 +37,16 @@ EXIT_USAGE = 2
 QueryTable = tuple[list[str], list[list[str]], dict[str, Any], list[RowColor]]
 
 QUERY_TARGETS = (
-    "system", "ssh", "firewall", "services", "ports", "sysctl", "audit", "updates", "all",
+    "system",
+    "ssh",
+    "firewall",
+    "fail2ban",
+    "services",
+    "ports",
+    "sysctl",
+    "audit",
+    "updates",
+    "all",
 )
 
 
@@ -123,9 +132,19 @@ def build_parser() -> argparse.ArgumentParser:
                 help="extra inbound rule (repeatable); 22345/tcp is always allowed first",
             )
         elif module.name == "fail2ban":
-            leaf.add_argument("--bantime", default="1h")
-            leaf.add_argument("--findtime", default="10m")
-            leaf.add_argument("--maxretry", default="5")
+            leaf.add_argument("--bantime", default=fail2ban_module.SSHD_BANTIME)
+            leaf.add_argument("--findtime", default="30m")
+            leaf.add_argument("--maxretry", default="3")
+            leaf.add_argument(
+                "--caddy",
+                action="store_true",
+                help="also enable the caddy jail and install the caddy-lhm filter",
+            )
+            leaf.add_argument(
+                "--caddy-maxretry",
+                default=fail2ban_module.CADDY_MAXRETRY,
+                help="caddy jail maxretry (default 5)",
+            )
         elif module.name == "sandbox":
             leaf.add_argument(
                 "services",
@@ -166,9 +185,15 @@ def build_parser() -> argparse.ArgumentParser:
     all_parser.add_argument(
         "--allow", action="append", default=[], metavar="PORT/PROTO", help="extra ufw rule"
     )
-    all_parser.add_argument("--bantime", default="1h")
-    all_parser.add_argument("--findtime", default="10m")
-    all_parser.add_argument("--maxretry", default="5")
+    all_parser.add_argument("--bantime", default=fail2ban_module.SSHD_BANTIME)
+    all_parser.add_argument("--findtime", default="30m")
+    all_parser.add_argument("--maxretry", default="3")
+    all_parser.add_argument(
+        "--caddy",
+        action="store_true",
+        help="also enable the caddy jail and install the caddy-lhm filter",
+    )
+    all_parser.add_argument("--caddy-maxretry", default=fail2ban_module.CADDY_MAXRETRY)
     all_parser.add_argument(
         "--webhook",
         default="",
@@ -324,6 +349,76 @@ def _query_firewall(
     return ["key", "value"], rows, payload, row_colors
 
 
+def _query_fail2ban(runner: Runner) -> QueryTable:
+    state = fail2ban_module.inspect(runner)
+    installed = state["installed"]
+    caddy_enabled = state["caddy_enabled"]
+    payload: dict[str, Any] = {
+        "installed": installed,
+        "active": state["active"],
+        "jail_dropin": state["jail_dropin"],
+        "jail_current": state["jail_current"],
+        "caddy_filter": state["caddy_filter"],
+        "caddy_filter_present": state["caddy_filter_present"],
+        "caddy_enabled": caddy_enabled,
+        "legacy_jail_local": state["legacy_jail_local"],
+        "legacy_jail_local_present": state["legacy_jail_local_present"],
+        "dbfile": state["dbfile"],
+        "dbfile_present": state["dbfile_present"],
+    }
+    rows: list[list[str]] = [
+        ["package installed", _flag(installed)],
+        ["service active", _flag(bool(state["active"]))],
+        [
+            "99-lhm.local drop-in",
+            "current" if state["jail_current"] else "missing or differs",
+        ],
+        ["dbfile present", _flag(bool(state["dbfile_present"]))],
+    ]
+    row_colors: list[RowColor] = [
+        [None, _judge(None if installed is None else bool(installed))],
+        [None, _judge(bool(state["active"]))],
+        [None, Color.GREEN if state["jail_current"] else Color.RED],
+        # bantime.increment silently does nothing without a dbfile.
+        [None, _judge(bool(state["dbfile_present"]))],
+    ]
+
+    sshd_targets = (
+        ("bantime", "14400"),
+        ("maxretry", "3"),
+        ("findtime", "1800"),
+    )
+    for key, want in sshd_targets:
+        value = fail2ban_module.jail_setting(runner, "sshd", key)
+        rows.append([f"sshd {key}", value if value is not None else "unavailable"])
+        row_colors.append([None, _judge(None if value is None else value == want)])
+        payload[f"sshd_{key}"] = value
+
+    increment = fail2ban_module.jail_increment_active(runner, "sshd")
+    rows.append(["sshd bantime.increment", _flag(increment)])
+    row_colors.append([None, _judge(increment)])
+    payload["sshd_bantime_increment"] = increment
+
+    if caddy_enabled is None:
+        rows.append(["caddy jail", "not configured"])
+        row_colors.append(None)
+    else:
+        rows.append(["caddy jail enabled", _flag(caddy_enabled)])
+        row_colors.append([None, Color.GREEN if caddy_enabled else None])
+        if caddy_enabled:
+            filter_ok = bool(state["caddy_filter_present"])
+            rows.append(["caddy-lhm filter", "present" if filter_ok else "missing"])
+            row_colors.append([None, _judge(filter_ok)])
+            caddy_status = runner.run(["fail2ban-client", "status", "caddy"], check=False)
+            caddy_live = caddy_status.ok and "caddy" in caddy_status.stdout
+            rows.append(["caddy jail live", _flag(caddy_live)])
+            row_colors.append([None, _judge(caddy_live)])
+    if state["legacy_jail_local_present"]:
+        rows.append(["legacy jail.local", "present (preserved, overridden by the drop-in)"])
+        row_colors.append(None)
+    return ["key", "value"], rows, payload, row_colors
+
+
 def _query_services(
     runner: Runner,
 ) -> QueryTable:
@@ -448,6 +543,7 @@ def _handle_query(args: argparse.Namespace, runner: Runner, as_json: bool) -> in
         "system": _query_system,
         "ssh": lambda: _query_ssh(runner),
         "firewall": lambda: _query_firewall(runner),
+        "fail2ban": lambda: _query_fail2ban(runner),
         "services": lambda: _query_services(runner),
         "ports": lambda: _query_ports(runner),
         "sysctl": _query_sysctl,
@@ -537,7 +633,12 @@ def _check_fail2ban(runner: Runner) -> tuple[bool, str]:
     if not state["installed"]:
         problems.append("package missing")
     if not state["jail_current"]:
-        problems.append("jail.local missing or differs")
+        problems.append("jail.d/99-lhm.local missing or differs")
+    if state["caddy_enabled"] and not state["caddy_filter_present"]:
+        problems.append("caddy jail enabled but filter.d/caddy-lhm.conf missing")
+    if state["installed"] and not state["dbfile_present"]:
+        # bantime.increment is silently inert without a dbfile.
+        problems.append(f"no dbfile at {state['dbfile']} (bantime.increment inert)")
     if not state["active"]:
         problems.append("fail2ban not active")
     return not problems, ", ".join(problems) if problems else "sshd jail configured and active"
@@ -716,6 +817,8 @@ def _apply_all_options(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
             "bantime": args.bantime,
             "findtime": args.findtime,
             "maxretry": args.maxretry,
+            "caddy": bool(args.caddy),
+            "caddy_maxretry": args.caddy_maxretry,
         },
         "alert": {"webhook": args.webhook},
         "backup": {"target": args.target, "keep": args.keep},
@@ -803,6 +906,8 @@ def _handle_apply(args: argparse.Namespace, runner: Runner, as_json: bool) -> in
         options["bantime"] = args.bantime
         options["findtime"] = args.findtime
         options["maxretry"] = args.maxretry
+        options["caddy"] = bool(args.caddy)
+        options["caddy_maxretry"] = args.caddy_maxretry
     elif name == "sandbox":
         options["services"] = list(args.services)
     elif name == "alert":

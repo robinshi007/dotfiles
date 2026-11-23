@@ -23,7 +23,7 @@ expect_lhm_ok "first apply fail2ban"
 FILES=(
     /etc/ssh/sshd_config.d/99-lhm.conf
     /etc/sysctl.d/99-lhm.conf
-    /etc/fail2ban/jail.local
+    /etc/fail2ban/jail.d/99-lhm.local
     /home/deploy/.ssh/authorized_keys
 )
 
@@ -37,7 +37,7 @@ snapshot() {
     done
     printf 'backups  '
     ls -1 /etc/ssh/sshd_config.d/99-lhm.conf.bak* /etc/sysctl.d/99-lhm.conf.bak* \
-          /etc/fail2ban/jail.local.bak* 2>/dev/null | tr '\n' ' '
+          /etc/fail2ban/jail.d/99-lhm.local.bak* 2>/dev/null | tr '\n' ' '
     echo
 }
 before=$(snapshot)

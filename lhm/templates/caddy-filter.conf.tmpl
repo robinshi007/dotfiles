@@ -1,0 +1,23 @@
+# ===== lhm-managed fail2ban filter for Caddy =====
+# Installed by lhm as /etc/fail2ban/filter.d/caddy-lhm.conf. Remove to revert.
+# Named caddy-lhm so a future upstream filter.d/caddy.conf cannot collide.
+#
+# Matches Caddy 2 access log lines written to journald (the default `log`
+# directive output). fail2ban 1.x has no native JSON parsing, so the raw JSON
+# text is matched by regex. This file is a string.Template, so every regex end
+# anchor is written doubled: the doubled form renders as a single anchor.
+[Definition]
+# Caddy JSON lines carry no timestamp fail2ban can parse; journald supplies the
+# line timestamp, so line-level date detection must be disabled.
+datepattern = {NONE}
+
+# Field order in Caddy JSON is not guaranteed, so remote_ip-before-status and
+# status-before-remote_ip are two separate patterns instead of one that assumes
+# an order. Failure statuses:
+#   401/403  - failed auth / forbidden access
+#   404      - path probing for secrets and admin endpoints
+#   429      - rate-limit abuse (Caddy answers 429 itself)
+# The status value is anchored with [,}] so a URI containing "404" (e.g.
+# "uri":"/404") cannot match: only a real "status" field ends with one of those.
+failregex = ^.*"remote_ip":"<HOST>".*"status":[ ]*(?:401|403|404|429)[,}].*$$
+            ^.*"status":[ ]*(?:401|403|404|429)[,}].*"remote_ip":"<HOST>".*$$

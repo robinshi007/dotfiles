@@ -33,7 +33,7 @@ and takes a few minutes on a cold cache.
   client, ufw, iptables, **nftables**, fail2ban + python3-systemd, auditd,
   unattended-upgrades, curl, iproute2, …) so scenarios test lhm, not apt.
   `nftables` is explicit because it is only a *Recommends* of fail2ban while
-  the shipped `jail.local` uses `banaction = nftables-multiport`.
+  the shipped `jail.d/99-lhm.local` uses `banaction = nftables-multiport`.
 * `uv sync --python 3.15` installs lhm into `/opt/lhm-venv`, with
   `/usr/local/bin/lhm` symlinked to it. The project is copied at build time, so
   rebuild after changing `src/`.
@@ -53,7 +53,7 @@ unattended scripts; it is not a CLI flag. See `src/lhm/core/confirm.py`.
 | 01 updates | `unattended-upgrades` installed/enabled, `51-lhm` written with security-only origins |
 | 02 ssh | user + key, drop-in, `sshd -T` agreement, listener on 22345, **real** key login, wrong key and password refused |
 | 03 firewall | ufw active, default deny incoming, `22345/tcp` allowed and **first** in rule order |
-| 04 fail2ban | service active, jail loaded, `fail2ban-client status sshd`, a ban really creates the nftables set |
+| 04 fail2ban | service active, `jail.d/99-lhm.local` written (strict sshd values, bantime.increment in `fail2ban-client -d`), legacy `jail.local` untouched by sha256, a ban really creates the nftables set; the live caddy jail is skipped (caddy is not in the image) |
 | 05 sysctl | live `kptr_restrict=2`, `dmesg_restrict=1`, `rp_filter=1`, second run is a no-op |
 | 06 audit | rules drop-in + `augenrules --check`; live audit only where the kernel allows it (see below) |
 | 07 … | sandbox ssh (drop-in + `systemd-analyze security`), persistent journal, alert timer, backup archive + `.sha256` |

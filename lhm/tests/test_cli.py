@@ -266,7 +266,17 @@ def test_query_all_prints_sections_with_separators(
     monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
     assert cli.main(["query", "all"]) == 0
     out = capsys.readouterr().out
-    for name in ("system", "ssh", "firewall", "services", "ports", "sysctl", "audit", "updates"):
+    for name in (
+        "system",
+        "ssh",
+        "firewall",
+        "fail2ban",
+        "services",
+        "ports",
+        "sysctl",
+        "audit",
+        "updates",
+    ):
         assert f"== {name} ==" in out
     assert out.index("== system ==") < out.index("== updates ==")
     # sections are separated by a blank line
@@ -282,7 +292,15 @@ def test_query_all_json_emits_pure_json(
     assert cli.main(["query", "all", "--json"]) == 0
     data = json.loads(capsys.readouterr().out)
     assert set(data) == {
-        "system", "ssh", "firewall", "services", "ports", "sysctl", "audit", "updates",
+        "system",
+        "ssh",
+        "firewall",
+        "fail2ban",
+        "services",
+        "ports",
+        "sysctl",
+        "audit",
+        "updates",
     }
 
 
@@ -422,3 +440,54 @@ def test_json_output_stays_pure_even_with_forced_color(
     out = capsys.readouterr().out
     assert "\033[" not in out
     json.loads(out)
+
+
+def test_apply_fail2ban_dry_run_shows_strict_values_and_both_paths(
+    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from lhm.modules import fail2ban
+
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    assert cli.main(["apply", "fail2ban", "--dry-run", "--caddy"]) == 0
+    out = capsys.readouterr().out
+    assert str(fail2ban.JAIL_DROPIN) in out
+    assert str(fail2ban.CADDY_FILTER) in out
+    assert "bantime 8h" in out
+    assert "maxretry 3" in out
+    assert "findtime 30m" in out
+    assert "caddy jail enabled in the drop-in" in out
+    assert "preserved untouched" in out
+    assert fake_exec.calls == []
+
+
+def test_query_fail2ban_judges_targets(
+    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    from lhm.modules import fail2ban
+
+    root = Path("/tmp") / "lhm-query-fail2ban" / "etc" / "fail2ban"
+    monkeypatch.setattr(fail2ban, "JAIL_DROPIN", root / "jail.d" / "99-lhm.local")
+    monkeypatch.setattr(fail2ban, "CADDY_FILTER", root / "filter.d" / "caddy-lhm.conf")
+    monkeypatch.setattr(fail2ban, "LEGACY_JAIL_LOCAL", root / "jail.local")
+    monkeypatch.setattr(fail2ban, "DBFILE", root / "fail2ban.sqlite3")
+    fake_exec.responses.extend(
+        [
+            ("dpkg-query", 0, "install ok installed", ""),
+            ("systemctl is-active fail2ban", 0, "active\n", ""),
+            ("fail2ban-client get sshd bantime", 0, "28800\n", ""),
+            ("fail2ban-client get sshd maxretry", 0, "3\n", ""),
+            ("fail2ban-client get sshd findtime", 0, "1800\n", ""),
+            ("fail2ban-client -d", 0, "['set', 'sshd', 'bantime.increment', True]\n", ""),
+        ]
+    )
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    assert cli.main(["query", "fail2ban", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["sshd_bantime"] == "28800"
+    assert data["sshd_maxretry"] == "3"
+    assert data["sshd_findtime"] == "1800"
+    assert data["sshd_bantime_increment"] is True
+    assert data["legacy_jail_local_present"] is False
+    assert data["caddy_enabled"] is None  # drop-in absent -> not configured

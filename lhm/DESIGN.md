@@ -13,13 +13,13 @@ pathlib, shutil, string.Template, json, hashlib, urllib.request). Dev dep: pytes
 ## CLI
 
 ```
-lhm query system|ssh|firewall|services|ports|sysctl|audit|updates [--json]
+lhm query system|ssh|firewall|fail2ban|services|ports|sysctl|audit|updates [--json]
 lhm check                                    # idempotency audit: OK / needs-change
 lhm apply updates [--security-only]
 lhm apply ssh-user NAME --key FILE [--sudo]
 lhm apply ssh-hardening [--port 22345]
 lhm apply firewall [--allow PORT/PROTO]...   # 22345/tcp pre-allowed by default
-lhm apply fail2ban [--bantime 1h --maxretry 5]
+lhm apply fail2ban [--bantime 8h --findtime 30m --maxretry 3] [--caddy]
 lhm apply cleanup-services                   # interactive per-item selection
 lhm apply sysctl
 lhm apply sandbox [SERVICE]...               # fixed whitelist only
@@ -58,7 +58,7 @@ or the dry-run guarantee.
 3. Drop-in preferred over appending (sshd first-match-wins semantics would
    silently ignore tail appends): `/etc/ssh/sshd_config.d/99-lhm.conf`,
    `/etc/sysctl.d/99-lhm.conf`, `/etc/systemd/system/<svc>.service.d/99-lhm-sandbox.conf`,
-   `/etc/audit/rules.d/99-lhm.rules`, `/etc/fail2ban/jail.local`,
+   `/etc/audit/rules.d/99-lhm.rules`, `/etc/fail2ban/jail.d/99-lhm.local`,
    `/etc/apt/apt.conf.d/51-lhm`. Creating a new drop-in is NOT a "modify existing
    file" op: no .bak needed; overwrite is idempotent (same content => skip).
 4. SSH anti-lockout order (apply ssh-user -> ssh-hardening): create user, install
@@ -81,7 +81,9 @@ or the dry-run guarantee.
    with only ssh-user done) must keep its current port open.
 6. Verify after every module (sshd -T grep, ss -tlnp listening port, ufw status
    verbose, sysctl spot checks, systemd-analyze security, augenrules --check,
-   fail2ban-client status). Any FAIL => non-zero exit + rollback hint.
+   fail2ban-client status, plus `fail2ban-client get sshd bantime` and
+   `fail2ban-client -d` for `bantime.increment`; unprobeable checks report
+   SKIPPED, not FAIL). Any FAIL => non-zero exit + rollback hint.
    A sandbox drop-in whose `systemctl restart` fails is rolled back automatically
    (restore newest `.bak`, else delete) and the step FAILs; ssh's
    ProtectHome=read-only keeps `/home/*/.ssh/authorized_keys` readable.
@@ -104,14 +106,33 @@ or the dry-run guarantee.
 | 1 | updates | apt update && upgrade (security-only option); install unattended-upgrades; template to apt.conf.d (security-only autoinstall) |
 | 2 | ssh | useradd + sudo group; authorized_keys; sshd drop-in incl Port 22345; sshd -t gate |
 | 3 | firewall | ufw allow 22345/tcp first, default deny incoming / allow outgoing, enable |
-| 4 | fail2ban | apt install fail2ban + nftables (nftables is only a Recommends of fail2ban; without it bans silently fail); jail.local template (sshd jail port 22345, backend systemd); cleanup-services: ss -tulpn + enabled units, per-item interactive selection |
+| 4 | fail2ban | apt install fail2ban + nftables (nftables is only a Recommends of fail2ban; without it bans silently fail); `jail.d/99-lhm.local` drop-in (sshd jail port 22345, backend systemd, mode aggressive, maxretry 3, findtime 30m, bantime 8h with bantime.increment/factor 3/maxtime 4w/rndtime 30m); optional caddy jail (`--caddy`) with the lhm-provided `filter.d/caddy-lhm.conf`; `/etc/fail2ban/jail.local` is never written (it holds the host's own jails and the drop-in wins by load order); cleanup-services: ss -tulpn + enabled units, per-item interactive selection |
 | 5 | sysctl+sandbox | sysctl.d template (rp_filter, no icmp redirects accept, kptr_restrict=2, dmesg_restrict, unprivileged_bpf_disabled); sandbox drop-ins for fixed whitelist only (sshd, nginx, fail2ban) with per-service exceptions |
 | 6 | audit/log/alert/backup | auditd + rules.d template + augenrules; journald persistent + logrotate template; alert = systemd timer + script scanning journalctl -p err / fail2ban bans since last run, webhook via urllib, state file; backup = timer + tar template (/etc /home), sha256 manifest, keep N rotate, local dir target |
 
+fail2ban load order is `jail.conf` → `jail.d/*.conf` → `jail.local` →
+`jail.d/*.local`, so the lhm drop-in overrides a hand-maintained `jail.local`
+without touching it. `bantime.increment` needs the dbfile (Debian/Ubuntu default
+`/var/lib/fail2ban/fail2ban.sqlite3`, enabled by packaging); the increment
+formula is `bantime * (1 << banCount) * bantime.factor` up to `bantime.maxtime`,
+so bantime 8h / factor 3 gives 8h, 48h, 4d, 8d, 16d, then 4w. fail2ban ships no
+Caddy filter and 1.x has no JSON parsing, so `caddy-lhm` matches the raw JSON
+access log by regex (status 401/403/404/429, two patterns because JSON field
+order is not guaranteed) and needs Caddy's access log in journald (Caddy's
+default `log` output). The caddy jail is off by default: an enabled jail whose
+`caddy.service` is missing stops fail2ban from starting. Activation is
+`fail2ban-client reload --restart` when the daemon is already active (jails are
+restarted in place, the server and its bans stay up) and `enable --now` when it
+is not: a plain `systemctl reload` never re-runs the action's `actionstart`, and
+when `banaction` resolves to a new action name fail2ban 1.0.2's reload deletes
+both the old and the new action, leaving the jail with no action at all — bans
+then only reach the DB and the nftables table is never created.
+
 ## Templates
 
-`templates/*.tmpl` rendered via string.Template. jail.local, 99-lhm-sysctl.conf,
-audit rules, unattended-upgrades conf, alert/backup timer+service+script.
+`templates/*.tmpl` rendered via string.Template: fail2ban `99-lhm.local` +
+`caddy-filter.conf`, 99-lhm-sysctl.conf, sshd hardening, audit rules,
+unattended-upgrades conf, journald, logrotate, alert/backup timer+service+script.
 
 ## Code layout
 

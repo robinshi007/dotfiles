@@ -1,0 +1,42 @@
+# ===== lhm fail2ban jail.d drop-in =====
+# Managed by lhm (/etc/fail2ban/jail.d/99-lhm.local). Remove this file to revert.
+# Load order: jail.conf -> jail.d/*.conf -> jail.local -> jail.d/*.local, so this
+# drop-in wins over a hand-maintained /etc/fail2ban/jail.local, which lhm NEVER
+# touches (that file keeps the host's own custom jails, e.g. dropbear).
+# backend=systemd: no log file polling, reads journald instead.
+
+[DEFAULT]
+backend = systemd
+banaction = nftables-multiport
+action = %(action_)s
+destemail = root
+sender = fail2ban@${hostname}
+
+[sshd]
+enabled = true
+port = ${ssh_port}
+mode = aggressive
+maxretry = ${maxretry}
+findtime = ${findtime}
+bantime = ${bantime}
+# Incrementing bans (default formula): bantime * (1 << banCount) * factor, up to
+# maxtime. With bantime 8h / factor 3: 8h, 48h, 4d, 8d, 16d, then capped at 4w.
+# Requires a dbfile (Debian/Ubuntu packaging default is enabled).
+bantime.increment = true
+bantime.factor = 3
+bantime.maxtime = 4w
+bantime.rndtime = 30m
+
+[caddy]
+enabled = ${caddy_enabled}
+port = 80,443
+backend = systemd
+journalmatch = _SYSTEMD_UNIT=caddy.service
+filter = caddy-lhm
+maxretry = ${caddy_maxretry}
+findtime = 10m
+bantime = 1h
+bantime.increment = true
+bantime.factor = 3
+bantime.maxtime = 4w
+bantime.rndtime = 30m

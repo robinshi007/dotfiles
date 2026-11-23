@@ -45,7 +45,8 @@ def test_apply_all_runs_modules_in_order(
     # Redirect every file target into tmp_path: the test must never touch /etc.
     root = tmp_path / "etc"
     monkeypatch.setattr("lhm.modules.updates.APT_CONF", root / "apt.conf.d" / "51-lhm")
-    monkeypatch.setattr(fail2ban, "JAIL_LOCAL", root / "fail2ban" / "jail.local")
+    monkeypatch.setattr(fail2ban, "JAIL_DROPIN", root / "fail2ban" / "jail.d" / "99-lhm.local")
+    monkeypatch.setattr(fail2ban, "CADDY_FILTER", root / "fail2ban" / "filter.d" / "caddy-lhm.conf")
     monkeypatch.setattr(sysctl, "SYSCTL_DROPIN", root / "sysctl.d" / "99-lhm.conf")
     monkeypatch.setattr(sandbox, "UNIT_DIR", root / "systemd")
     monkeypatch.setattr(logging, "JOURNALD_DROPIN", root / "journald.conf.d" / "99-lhm.conf")
@@ -88,6 +89,11 @@ def test_apply_all_runs_modules_in_order(
             configured.add("ufw")
             return subprocess.CompletedProcess(cmd, 0, "", "")
         if cmd[:1] == ["fail2ban-client"]:
+            if cmd[1:2] == ["-d"]:
+                dump = "['set', 'sshd', 'bantime.increment', True]\n"
+                return subprocess.CompletedProcess(cmd, 0, dump, "")
+            if cmd[1:2] == ["get"]:
+                return subprocess.CompletedProcess(cmd, 0, "28800\n", "")
             out = "Status for the jail: sshd\n|- Currently banned: 0\n"
             return subprocess.CompletedProcess(cmd, 0, out, "")
         if cmd[:1] == [str(root / "lhm-backup.sh")]:
@@ -138,8 +144,9 @@ def test_apply_all_runs_modules_in_order(
     # Order: updates -> ssh -> firewall (ufw allow 22345/tcp first).
     assert joined.index("apt-get update") < joined.index("getent passwd testadmin")
     assert joined.index("getent passwd testadmin") < joined.index("ufw allow 22345/tcp")
-    # Never runs the interactive cleanup-services listing.
-    assert "list-unit-files" not in joined
+    # Never runs the interactive cleanup-services listing (the caddy probe in
+    # fail2ban uses list-unit-files for one specific unit only).
+    assert "list-unit-files --state=enabled" not in joined
 
 
 def test_apply_all_requires_webhook_and_target(
