@@ -210,7 +210,20 @@ def _query_ssh(runner: Runner) -> tuple[list[str], list[list[str]], dict[str, An
         "x11forwarding",
         "maxauthtries",
     )
-    payload: dict[str, Any] = {key: config.get(key, "unavailable") for key in keys}
+    if not config:
+        # sshd -T reads every included file and fails without root when any of
+        # them is root-only (e.g. 50-cloud-init.conf). Distinguish "cannot
+        # probe" from "not configured" instead of silently printing unavailable.
+        payload: dict[str, Any] = {
+            "available": False,
+            "note": "sshd -T failed (try: sudo lhm query ssh)",
+        }
+        rows = [[key, "unavailable (needs root)"] for key in keys]
+        rows.append(["99-lhm drop-in", "current" if state["dropin_current"] else "differs"])
+        rows.append(["authorized users", " ".join(state["authorized_users"]) or "-"])
+        rows.append(["hint", "run: sudo lhm query ssh"])
+        return ["setting", "effective value"], rows, payload
+    payload = {key: config.get(key, "unavailable") for key in keys}
     payload["dropin"] = state["dropin"]
     payload["dropin_current"] = state["dropin_current"]
     payload["authorized_users"] = state["authorized_users"]

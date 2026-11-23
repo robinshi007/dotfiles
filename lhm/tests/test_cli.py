@@ -243,3 +243,33 @@ def test_usage_error_on_missing_subcommand() -> None:
     with pytest.raises(SystemExit) as excinfo:
         cli.main([])
     assert excinfo.value.code == 2
+
+
+def test_query_ssh_without_root_reports_needs_root(
+    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # sshd -T fails (e.g. root-only drop-in files) -> values must say so, not
+    # silently print "unavailable".
+    fake_exec.responses.append(
+        ("sshd -T", 1, "", "/etc/ssh/sshd_config.d/50-cloud-init.conf: Permission denied")
+    )
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    assert cli.main(["query", "ssh"]) == 0
+    out = capsys.readouterr().out
+    assert "unavailable (needs root)" in out
+    assert "sudo lhm query ssh" in out
+
+
+def test_query_ssh_with_effective_config_shows_values(
+    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_exec.responses.append(
+        ("sshd -T", 0, "port 22345\npermitrootlogin no\npasswordauthentication no\n", "")
+    )
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    assert cli.main(["query", "ssh"]) == 0
+    out = capsys.readouterr().out
+    # provided keys show real values; the missing four stay "unavailable"
+    assert "22345" in out
+    assert "needs root" not in out
+    assert out.count("unavailable") == 4
