@@ -1,0 +1,19 @@
+#!/bin/sh
+# ===== lhm alert script (template) =====
+# Installed to /usr/local/lib/lhm/lhm-alert.sh by `lhm apply alert`.
+# Scans journal for priority<=err since last run and posts to webhook.
+set -eu
+WEBHOOK_URL='${webhook_url}'
+STATE_FILE='/var/lib/lhm/alert-last-run'
+SINCE=$(cat "$STATE_FILE" 2>/dev/null || date -u '+%Y-%m-%d %H:%M:%S' -d '1 hour ago')
+NOW=$(date -u '+%Y-%m-%d %H:%M:%S')
+
+ERRS=$(journalctl --since "$SINCE" --until "$NOW" -p err --no-pager -q | tail -n 50 || true)
+BANS=$(/usr/bin/fail2ban-client status sshd 2>/dev/null | sed -n 's/.*Currently banned:[[:space:]]*//p' || echo 0)
+
+if [ -n "$ERRS" ] || [ "$BANS" -gt 0 ]; then
+    PAYLOAD=$(printf '{"text": "lhm alert %s\\nssh port: %s, banned: %s\\nerrors:\\n%s"}' \
+        "$(hostname)" "${ssh_port}" "$BANS" "$(printf '%s' "$ERRS" | head -c 2000 | sed 's/"/\\"/g')")
+    curl -fsS -m 10 -H 'Content-Type: application/json' -d "$PAYLOAD" "$WEBHOOK_URL" >/dev/null || true
+fi
+mkdir -p "$(dirname "$STATE_FILE")" && echo "$NOW" > "$STATE_FILE"

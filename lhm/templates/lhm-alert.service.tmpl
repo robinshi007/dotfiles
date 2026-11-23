@@ -1,0 +1,12 @@
+[Unit]
+Description=lhm daily alert (journal errors + fail2ban bans)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/lhm/lhm-alert.sh
+# sandbox the alert script itself
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/lhm

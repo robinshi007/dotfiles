@@ -1,0 +1,8 @@
+# ===== lhm journald hardening =====
+# Managed by lhm (/etc/systemd/journald.conf.d/99-lhm.conf). Remove to revert.
+[Journal]
+Storage=persistent
+Compress=yes
+RateLimitIntervalSec=30s
+RateLimitBurst=1000
+MaxRetentionSec=90day

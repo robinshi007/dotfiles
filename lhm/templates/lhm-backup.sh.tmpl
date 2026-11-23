@@ -1,0 +1,27 @@
+#!/bin/sh
+# ===== lhm backup script (template) =====
+# Installed to /usr/local/lib/lhm/lhm-backup.sh by `lhm apply backup`.
+# tars /etc and /home with sha256 manifest, rotates keeping N copies.
+set -eu
+TARGET_DIR='${target_dir}'
+KEEP=${keep}
+STAMP=$(date -u '+%Y%m%dT%H%M%SZ')
+OUT="$TARGET_DIR/lhm-backup-$STAMP.tar.gz"
+
+# 0700 dir + 077 umask: archives are 0600 (they contain /etc/shadow and keys).
+umask 077
+mkdir -p "$TARGET_DIR"
+chmod 700 "$TARGET_DIR"
+if ! tar -czf "$OUT" --one-file-system /etc /home; then
+    # Never leave a truncated archive behind: verify would accept it and
+    # rotation would then delete the last good backup.
+    rm -f "$OUT" "$OUT.sha256"
+    echo "lhm-backup: tar failed, removed $OUT" >&2
+    exit 1
+fi
+sha256sum "$OUT" > "$OUT.sha256"
+
+# rotate: keep newest $KEEP backups
+ls -1t "$TARGET_DIR"/lhm-backup-*.tar.gz 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r f; do
+    rm -f "$f" "$f.sha256"
+done

@@ -1,0 +1,13 @@
+# ===== lhm logrotate for audit log =====
+# Managed by lhm (/etc/logrotate.d/lhm-audit). Remove to revert.
+/var/log/audit/audit.log {
+    daily
+    rotate 30
+    missingok
+    notifempty
+    compress
+    delaycompress
+    postrotate
+        /usr/sbin/service auditd try-restart >/dev/null 2>&1 || true
+    endscript
+}

@@ -1,0 +1,11 @@
+[Unit]
+Description=lhm daily alert (journal errors + fail2ban bans)
+Documentation=file:/usr/local/lib/lhm/lhm-alert.sh
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+RandomizedDelaySec=30m
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=lhm daily backup (/etc + /home)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/lhm/lhm-backup.sh
+# sandbox the backup script itself
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadWritePaths=${target_dir}
