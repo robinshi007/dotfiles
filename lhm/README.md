@@ -42,6 +42,7 @@ sudo "$(which lhm)" apply updates    # uv tool install / system install
 
 ```sh
 lhm query system|ssh|firewall|services|ports|sysctl|audit|updates [--json]
+lhm query all                   # every section, == name == separators
 lhm check                       # idempotency audit across all 11 areas
 
 lhm apply updates [--security-only]

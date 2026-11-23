@@ -260,6 +260,32 @@ def test_query_ssh_without_root_reports_needs_root(
     assert "sudo lhm query ssh" in out
 
 
+def test_query_all_prints_sections_with_separators(
+    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    assert cli.main(["query", "all"]) == 0
+    out = capsys.readouterr().out
+    for name in ("system", "ssh", "firewall", "services", "ports", "sysctl", "audit", "updates"):
+        assert f"== {name} ==" in out
+    assert out.index("== system ==") < out.index("== updates ==")
+    # sections are separated by a blank line
+    assert "\n\n== ssh ==" in out
+
+
+def test_query_all_json_emits_pure_json(
+    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    assert cli.main(["query", "all", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert set(data) == {
+        "system", "ssh", "firewall", "services", "ports", "sysctl", "audit", "updates",
+    }
+
+
 def test_query_ssh_with_effective_config_shows_values(
     fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

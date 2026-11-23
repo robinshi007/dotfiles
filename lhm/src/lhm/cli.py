@@ -1,13 +1,14 @@
 """argparse assembly and exit codes for the ``lhm`` CLI."""
 
 import argparse
+import json
 import logging
 import os
 import platform
 import socket
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from lhm.core import checks
 from lhm.core.backup import backup_file, newest_backup, rollback_file
@@ -32,7 +33,9 @@ EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_USAGE = 2
 
-QUERY_TARGETS = ("system", "ssh", "firewall", "services", "ports", "sysctl", "audit", "updates")
+QUERY_TARGETS = (
+    "system", "ssh", "firewall", "services", "ports", "sysctl", "audit", "updates", "all",
+)
 
 
 def _add_global_flags(parser: argparse.ArgumentParser, *, suppress: bool = False) -> None:
@@ -338,7 +341,7 @@ def _query_updates(runner: Runner) -> tuple[list[str], list[list[str]], dict[str
 
 
 def _handle_query(args: argparse.Namespace, runner: Runner, as_json: bool) -> int:
-    builders = {
+    builders: dict[str, Callable[[], tuple[list[str], list[list[str]], dict[str, Any]]]] = {
         "system": _query_system,
         "ssh": lambda: _query_ssh(runner),
         "firewall": lambda: _query_firewall(runner),
@@ -348,8 +351,34 @@ def _handle_query(args: argparse.Namespace, runner: Runner, as_json: bool) -> in
         "audit": lambda: _query_audit(runner),
         "updates": lambda: _query_updates(runner),
     }
+    if args.target == "all":
+        return _query_all(runner, builders, as_json)
     headers, rows, payload = builders[args.target]()
     print_table(headers, rows, as_json=as_json, payload=payload)
+    return EXIT_OK
+
+
+def _query_all(
+    runner: Runner,
+    builders: dict[str, Callable[[], tuple[list[str], list[list[str]], dict[str, Any]]]],
+    as_json: bool,
+) -> int:
+    """Print every query section in order, separated by == name == headers."""
+    sections: dict[str, object] = {}
+    if as_json:
+        for name, build in builders.items():
+            _headers, _rows, payload = build()
+            sections[name] = payload
+        print(json.dumps(sections, indent=2, sort_keys=True))
+        return EXIT_OK
+    first = True
+    for name, build in builders.items():
+        if not first:
+            print()
+        first = False
+        print(f"== {name} ==")
+        headers, rows, payload = build()
+        print_table(headers, rows, as_json=False)
     return EXIT_OK
 
 
