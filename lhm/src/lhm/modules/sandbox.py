@@ -180,7 +180,7 @@ def apply_sandbox(runner: Runner, *, services: Sequence[str] = ()) -> list[StepR
         return [*results, *_verify_all(runner, usable)]
 
     if not confirm_twice(plan):
-        return [StepResult("sandbox", Status.SKIPPED, "aborted; no changes made")]
+        return [StepResult("sandbox", Status.ABORTED, "aborted; no changes made")]
 
     results = [
         StepResult(f"skip {unit_name(s)}", Status.SKIPPED, "unit not installed")

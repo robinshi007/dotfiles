@@ -164,3 +164,24 @@ def test_empty_archive_fails(paths: dict[str, Path]) -> None:
     archive.write_bytes(b"")
     archive.with_name(archive.name + ".sha256").write_text("x\n", encoding="utf-8")
     assert backup.verify_archive(target).status is Status.FAIL
+
+
+@pytest.mark.parametrize("target", ["/srv/a b", "/srv/a%n", "//etc/backup", "/srv/a\tb"])
+def test_space_percent_and_double_slash_refused(
+    target: str, fake_exec: Any, paths: dict[str, Path]
+) -> None:
+    results = backup.apply_backup(Runner(exec_fn=fake_exec), target=target, keep=7)
+    assert results[0].status is Status.FAIL
+    assert fake_exec.calls == []
+    assert not paths["script"].exists()
+
+
+def test_symlinked_parent_inside_etc_is_refused(
+    tmp_path: Path, fake_exec: Any, paths: dict[str, Path]
+) -> None:
+    link = tmp_path / "sneaky"
+    link.symlink_to("/etc")
+    results = backup.apply_backup(Runner(exec_fn=fake_exec), target=str(link / "backup"), keep=7)
+    assert results[0].status is Status.FAIL
+    assert "inside /etc" in results[0].detail
+    assert fake_exec.calls == []

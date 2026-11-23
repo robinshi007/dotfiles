@@ -18,6 +18,9 @@ class Status(StrEnum):
     CHANGED = "CHANGED"
     FAIL = "FAIL"
     PLANNED = "PLANNED"
+    # The user (or a non-TTY stdin) refused the confirmation: nothing was
+    # changed, which is not the same outcome as "already done" or "failed".
+    ABORTED = "ABORTED"
 
 
 @dataclass(frozen=True)

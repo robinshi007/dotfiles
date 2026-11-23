@@ -74,7 +74,7 @@ def apply_logging(runner: Runner) -> list[StepResult]:
         ]
 
     if not confirm_twice(plan):
-        return [StepResult("logging", Status.SKIPPED, "aborted; no changes made")]
+        return [StepResult("logging", Status.ABORTED, "aborted; no changes made")]
 
     results: list[StepResult] = []
     try:

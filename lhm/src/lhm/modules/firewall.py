@@ -29,12 +29,16 @@ def _to_ports(to: str) -> set[str]:
     return {part.strip() for part in to.split(",") if part.strip()}
 
 
+INBOUND_ALLOW_ACTIONS = frozenset({"ALLOW", "ALLOW IN"})
+
+
 def _rule_present(status: checks.UfwStatus | None, rule: str) -> bool:
+    """True only for an inbound allow rule (``ALLOW FWD`` must not count)."""
     if status is None:
         return False
     for existing in status.rules:
         to = existing.to.replace(" (v6)", "")
-        if existing.action.startswith("ALLOW") and rule in _to_ports(to):
+        if existing.action in INBOUND_ALLOW_ACTIONS and rule in _to_ports(to):
             return True
     return False
 
@@ -48,10 +52,23 @@ def apply_firewall(runner: Runner, *, allow: Sequence[str] = ()) -> list[StepRes
     # Probe the ports sshd listens on RIGHT NOW: a server still on 22 must not
     # lose its listener when ufw flips to default deny incoming.
     current = [] if runner.dry_run else checks.current_ssh_ports(runner)
+    if not runner.dry_run and not current and not extra:
+        # Fail closed: with no probed listener and no --allow, default deny can
+        # only lock the operator out. Nothing is run (not even `ufw status`).
+        return [
+            StepResult(
+                "firewall",
+                Status.FAIL,
+                "no live SSH listener detected (ss/sshd -T unavailable): refusing "
+                "default deny incoming; install iproute2/openssh-server so the port "
+                "can be probed, or re-run with --allow PORT/tcp naming the port you "
+                "are connected to",
+            )
+        ]
     if not runner.dry_run and not current:
         print(
             "lhm: warning: no current SSH listener detected via ss/sshd -T; "
-            "make sure --allow covers the port you are connected to",
+            "only the explicitly allowed ports will stay open",
             flush=True,
         )
     current_rules = [f"{port}/tcp" for port in current if port != SSH_PORT]
@@ -124,7 +141,7 @@ def apply_firewall(runner: Runner, *, allow: Sequence[str] = ()) -> list[StepRes
         return [StepResult("firewall", Status.SKIPPED, "rules and defaults already in place")]
 
     if not confirm_twice(plan):
-        return [StepResult("firewall", Status.SKIPPED, "aborted; no changes made")]
+        return [StepResult("firewall", Status.ABORTED, "aborted; no changes made")]
 
     results = []
     try:

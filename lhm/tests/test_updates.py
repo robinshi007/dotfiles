@@ -91,7 +91,7 @@ def test_refusal_makes_no_changes(
     monkeypatch.setattr(updates, "confirm_twice", lambda plan: False)
     fake_exec.responses.append(("dpkg-query", 1, "", ""))
     results = updates.UpdatesModule().apply(Runner(exec_fn=fake_exec))
-    assert results[0].status is Status.SKIPPED
+    assert results[0].status is Status.ABORTED
     assert not conf_path.exists()
     mutating = [c for c in fake_exec.calls if "--version" not in c]
     assert not any("apt-get" in " ".join(c) for c in mutating)

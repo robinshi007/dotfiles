@@ -195,7 +195,7 @@ def apply_cleanup_services(runner: Runner, *, select: str = "") -> list[StepResu
         plan.append(f"  - systemctl disable --now {item.unit} (package {item.package} kept)")
     plan.append("  - no packages are removed or purged")
     if not _final_confirm(plan):
-        return [StepResult("cleanup-services", Status.SKIPPED, "aborted; no changes made")]
+        return [StepResult("cleanup-services", Status.ABORTED, "aborted; no changes made")]
 
     results: list[StepResult] = []
     try:

@@ -460,3 +460,132 @@ def test_rollback_delete_prints_red_minus(home: Path) -> None:
         colors.set_output(None)
     assert stream.getvalue() == f"\033[31m- {ssh.SSHD_DROPIN}\033[0m\n"
     assert not ssh.SSHD_DROPIN.exists()
+
+
+SSHD_T_ALLOW_OTHER = SSHD_T_OK + "allowusers bob\n"
+
+
+def test_effective_problems_flags_allowusers_missing_admin() -> None:
+    config = {
+        "port": "22345",
+        "permitrootlogin": "no",
+        "passwordauthentication": "no",
+        "allowusers": "bob carol",
+    }
+    problems = ssh._effective_problems(config, 22345, ["robin", "bob"])
+    assert len(problems) == 1
+    assert "allowusers missing robin" in problems[0]
+
+
+def test_effective_problems_accepts_allowusers_superset() -> None:
+    config = {
+        "port": "22345",
+        "permitrootlogin": "no",
+        "passwordauthentication": "no",
+        "allowusers": "robin bob",
+    }
+    assert ssh._effective_problems(config, 22345, ["robin"]) == []
+
+
+def test_effective_problems_ignores_empty_allowusers() -> None:
+    config = {
+        "port": "22345",
+        "permitrootlogin": "no",
+        "passwordauthentication": "no",
+        "allowusers": "",
+    }
+    assert ssh._effective_problems(config, 22345, ["robin"]) == []
+
+
+def test_hardening_allowusers_gate_rolls_back_and_fails(
+    fake_exec: Any, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An earlier drop-in's AllowUsers wins: the admin would be locked out."""
+    monkeypatch.setattr(ssh, "confirm_twice", lambda plan: True)
+    seed_user(home, "robin")
+    fake_exec.responses.extend(
+        [
+            ("sshd -t", 0, "", ""),
+            ("sshd -T", 0, SSHD_T_ALLOW_OTHER, ""),
+        ]
+    )
+    results = ssh.apply_hardening(Runner(exec_fn=fake_exec), port=22345, allow_users=["robin"])
+    gate = next(r for r in results if r.name == "sshd -T effective")
+    assert gate.status is Status.FAIL
+    assert "allowusers missing robin" in gate.detail
+    assert not ssh.SSHD_DROPIN.exists()
+    order = [" ".join(call) for call in fake_exec.calls]
+    assert not any(call.startswith("systemctl reload") for call in order)
+    assert not any(call.startswith("systemctl restart") for call in order)
+
+
+class SocketRestartFailsExec:
+    """ssh.socket active; disabling it then restarting ssh/sshd both fail."""
+
+    def __init__(self, *, socket_reenables: bool = True) -> None:
+        self.calls: list[list[str]] = []
+        self.socket_reenables = socket_reenables
+
+    def __call__(self, cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        self.calls.append(list(cmd))
+        if cmd == ["sshd", "-t"]:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if cmd == ["sshd", "-T"]:
+            return subprocess.CompletedProcess(cmd, 0, SSHD_T_OK + "allowusers robin\n", "")
+        if cmd == ["systemctl", "is-active", "ssh.socket"]:
+            return subprocess.CompletedProcess(cmd, 0, "active\n", "")
+        if cmd[:3] == ["systemctl", "disable", "--now"]:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if cmd[:2] == ["systemctl", "restart"]:
+            return subprocess.CompletedProcess(cmd, 1, "", "Unit not found.")
+        if cmd[:3] == ["systemctl", "enable", "--now"]:
+            if self.socket_reenables:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return subprocess.CompletedProcess(cmd, 1, "", "Failed to enable unit")
+        if cmd == ["systemctl", "start", "ssh"]:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if cmd == ["ss", "-tlnp"]:
+            return subprocess.CompletedProcess(cmd, 0, SS_TLN_OLD_PORT, "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+
+def test_hardening_restores_socket_after_restart_failure(
+    home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(ssh, "confirm_twice", lambda plan: True)
+    seed_user(home, "robin")
+    exec_fn = SocketRestartFailsExec()
+    results = ssh.apply_hardening(Runner(exec_fn=exec_fn), port=22345, allow_users=["robin"])
+    order = [" ".join(call) for call in exec_fn.calls]
+    assert "systemctl disable --now ssh.socket" in order
+    assert "systemctl restart ssh" in order and "systemctl restart sshd" in order
+    enable = order.index("systemctl enable --now ssh.socket")
+    assert enable > order.index("systemctl restart sshd")
+    assert order[enable + 1] == "systemctl is-active ssh.socket"
+    assert order[enable + 2] == "ss -tlnp"
+    steps = {r.name: r for r in results}
+    assert steps["restore ssh.socket"].status is Status.CHANGED
+    assert "22/tcp" in steps["restore ssh.socket"].detail
+    assert steps["reload sshd"].status is Status.FAIL
+    assert "previous socket-activated listener was restored" in steps["reload sshd"].detail
+    assert not ssh.SSHD_DROPIN.exists()  # drop-in rolled back
+    assert "rollback hint" in capsys.readouterr().out
+
+
+def test_hardening_double_failure_prints_manual_recovery(
+    home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(ssh, "confirm_twice", lambda plan: True)
+    seed_user(home, "robin")
+    exec_fn = SocketRestartFailsExec(socket_reenables=False)
+    results = ssh.apply_hardening(Runner(exec_fn=exec_fn), port=22345, allow_users=["robin"])
+    order = [" ".join(call) for call in exec_fn.calls]
+    assert "systemctl start ssh" in order
+    steps = {r.name: r for r in results}
+    assert steps["restore ssh.socket"].status is Status.FAIL
+    assert steps["reload sshd"].status is Status.FAIL
+    assert "systemctl start ssh` succeeded" in steps["reload sshd"].detail
+    assert not ssh.SSHD_DROPIN.exists()
+    err = capsys.readouterr().err
+    assert "SSH may be DOWN" in err
+    assert "systemctl enable --now ssh.socket" in err

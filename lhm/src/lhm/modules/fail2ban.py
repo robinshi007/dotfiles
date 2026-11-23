@@ -361,7 +361,7 @@ def apply_fail2ban(
         return results
 
     if not confirm_twice(plan):
-        return [StepResult("fail2ban", Status.SKIPPED, "aborted; no changes made")]
+        return [StepResult("fail2ban", Status.ABORTED, "aborted; no changes made")]
 
     results = []
     try:

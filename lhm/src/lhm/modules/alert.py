@@ -24,21 +24,38 @@ class WebhookError(ValueError):
     """Raised when the webhook URL is not an https:// URL."""
 
 
+def _host(url: str) -> str:
+    """URL host with any ``user:password@`` prefix removed."""
+    return url.split("://", 1)[-1].split("/", 1)[0].rpartition("@")[2]
+
+
+def _redacted(url: str) -> str:
+    """Scheme + host only: a webhook URL's path/query (and credentials) is the secret."""
+    value = url.strip()
+    prefix = "https://" if value.startswith("https://") else ""
+    host = _host(value)
+    if not host:
+        return "(no host)"
+    return f"{prefix}{host}/..." if prefix else f"{host}/..."
+
+
 def validate_webhook(url: str) -> str:
     """Refuse anything but https:// (no plaintext webhook credentials)."""
     value = url.strip()
     if not value.startswith("https://"):
         raise WebhookError(
-            f"refusing webhook {url!r}: only https:// URLs are accepted "
+            f"refusing webhook {_redacted(url)}: only https:// URLs are accepted "
             "(plaintext credentials are not allowed)"
         )
     host = value.removeprefix("https://").split("/", 1)[0]
     if not host:
-        raise WebhookError(f"refusing webhook {url!r}: missing host")
+        raise WebhookError(f"refusing webhook {_redacted(url)}: missing host")
     if "'" in value:
-        raise WebhookError(f"refusing webhook {url!r}: contains a single quote")
+        raise WebhookError(f"refusing webhook {_redacted(url)}: contains a single quote")
     if any(character <= " " or character == "\x7f" for character in value):
-        raise WebhookError(f"refusing webhook {url!r}: contains whitespace/control characters")
+        raise WebhookError(
+            f"refusing webhook {_redacted(url)}: contains whitespace/control characters"
+        )
     return value
 
 
@@ -81,8 +98,7 @@ def apply_alert(runner: Runner, *, webhook: str = "") -> list[StepResult]:
 
     plan = ["Plan (alert):"]
     plan.append(
-        f"  - install {SCRIPT} (0700 root:root, webhook host "
-        f"{url.removeprefix('https://').split('/')[0]})"
+        f"  - install {SCRIPT} (0700 root:root, webhook host {_host(url)})"
         if script_needed
         else f"  - {SCRIPT} already current (skip)"
     )
@@ -130,15 +146,16 @@ def apply_alert(runner: Runner, *, webhook: str = "") -> list[StepResult]:
             ]
 
     if not confirm_twice(plan):
-        return [StepResult("alert", Status.SKIPPED, "aborted; no changes made")]
+        return [StepResult("alert", Status.ABORTED, "aborted; no changes made")]
 
     results: list[StepResult] = []
     try:
         if script_needed:
             SCRIPT.parent.mkdir(parents=True, exist_ok=True)
             # 0700 (and root:root): the script embeds the webhook URL, and its
-            # .bak copy gets the same mode.
-            write_dropin(SCRIPT, script, mode=0o700)
+            # .bak copy gets the same mode. ``secret`` keeps --verbose from
+            # echoing the URL (content and diff are suppressed).
+            write_dropin(SCRIPT, script, mode=0o700, secret=True)
             restrict(SCRIPT, 0o700)
             results.append(StepResult(f"install {SCRIPT}", Status.CHANGED, "0700 root:root"))
         else:

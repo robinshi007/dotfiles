@@ -1,6 +1,7 @@
 """Backup module: systemd timer + tar script with sha256 manifest and rotation."""
 
 import os
+import re
 from pathlib import Path
 
 from lhm.core.checks import probe_service
@@ -26,24 +27,35 @@ class TargetError(ValueError):
     """Raised when the backup target is not an acceptable absolute directory."""
 
 
+SAFE_TARGET = re.compile(r"[A-Za-z0-9/_.-]+")
+
+
 def validate_target(value: str) -> Path:
     target = Path(value)
     if not target.is_absolute():
         raise TargetError(f"refusing backup target {value!r}: must be an absolute path")
     if ".." in target.parts:
         raise TargetError(f"refusing backup target {value!r}: contains '..'")
-    if target == Path("/"):
-        raise TargetError("refusing backup target '/': use a dedicated directory")
-    for guarded in (Path("/home"), Path("/etc")):
-        if target == guarded or guarded in target.parents:
-            raise TargetError(
-                f"refusing backup target {value!r}: it is inside {guarded} "
-                "(tar would archive the growing archive itself)"
-            )
     if "'" in str(target):
         raise TargetError(f"refusing backup target {value!r}: contains a single quote")
     if any(character < " " or character == "\x7f" for character in str(target)):
         raise TargetError(f"refusing backup target {value!r}: contains control characters")
+    if not SAFE_TARGET.fullmatch(str(target)):
+        # A space splits systemd's ReadWritePaths=, % is a specifier expansion.
+        raise TargetError(
+            f"refusing backup target {value!r}: only [A-Za-z0-9/_.-] are allowed "
+            "(no spaces or '%')"
+        )
+    # Resolve '//etc' and symlinked parents before the guards: Path('//') != Path('/').
+    resolved = target.resolve(strict=False)
+    if resolved == Path("/"):
+        raise TargetError("refusing backup target '/': use a dedicated directory")
+    for guarded in (Path("/home"), Path("/etc")):
+        if resolved == guarded or guarded in resolved.parents:
+            raise TargetError(
+                f"refusing backup target {value!r}: it is inside {guarded} "
+                "(tar would archive the growing archive itself)"
+            )
     return target
 
 
@@ -163,7 +175,7 @@ def apply_backup(
             ]
 
     if not confirm_twice(plan):
-        return [StepResult("backup", Status.SKIPPED, "aborted; no changes made")]
+        return [StepResult("backup", Status.ABORTED, "aborted; no changes made")]
 
     results: list[StepResult] = []
     try:

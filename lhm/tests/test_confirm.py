@@ -92,3 +92,15 @@ def test_bypass_requires_exact_one(
 def test_bypass_unset_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(BYPASS_ENV, raising=False)
     assert bypass_requested() is False
+
+
+@pytest.mark.parametrize("value", [" 1 ", "1\n", "1 ", "\t1"])
+def test_bypass_padding_is_not_accepted(
+    monkeypatch: pytest.MonkeyPatch, value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The documented value is exactly ``1``; padding must not bypass the gate."""
+    monkeypatch.setenv(BYPASS_ENV, value)
+    monkeypatch.setattr(sys, "stdin", NoTty("y\ny\n"))
+    assert bypass_requested() is False
+    assert confirm_twice(["plan"]) is False
+    assert "not a TTY" in capsys.readouterr().err

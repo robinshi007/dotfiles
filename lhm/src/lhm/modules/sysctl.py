@@ -119,7 +119,7 @@ def apply_sysctl(runner: Runner) -> list[StepResult]:
         ]
 
     if not confirm_twice(plan):
-        return [StepResult("sysctl", Status.SKIPPED, "aborted; no changes made")]
+        return [StepResult("sysctl", Status.ABORTED, "aborted; no changes made")]
 
     results: list[StepResult] = []
     try:

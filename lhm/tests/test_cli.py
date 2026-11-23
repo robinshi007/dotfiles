@@ -59,7 +59,8 @@ def test_apply_updates_non_tty_fails_closed(
     monkeypatch.setattr(cli, "is_root", lambda: True)
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
     fake_exec.responses.append(("dpkg-query", 1, "", "not installed"))
-    assert cli.main(["apply", "updates"]) == 0
+    # Non-TTY: nothing is written, but the run must not look like "already done".
+    assert cli.main(["apply", "updates"]) == cli.EXIT_ABORT
     assert not target.exists()
     mutating = [c for c in fake_exec.calls if "--version" not in c]
     assert not any("apt-get" in " ".join(c) for c in mutating)
@@ -78,7 +79,7 @@ def test_all_modules_now_implemented(
     monkeypatch.setattr(cli, "is_root", lambda: True)
     # sysctl is implemented now: a non-TTY run must abort inside the module (no y answers)
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
-    assert cli.main(["apply", "sysctl"]) == 0
+    assert cli.main(["apply", "sysctl"]) == cli.EXIT_ABORT
     assert "aborted" in capsys.readouterr().out
 
 
@@ -491,3 +492,34 @@ def test_query_fail2ban_judges_targets(
     assert data["sshd_bantime_increment"] is True
     assert data["legacy_jail_local_present"] is False
     assert data["caddy_enabled"] is None  # drop-in absent -> not configured
+
+
+def test_apply_abort_by_user_answer_exits_3(
+    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from lhm.modules import updates
+
+    target = tmp_path / "51-lhm"
+    monkeypatch.setattr(updates, "APT_CONF", target)
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    monkeypatch.setattr(cli, "is_root", lambda: True)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    fake_exec.responses.append(("dpkg-query", 1, "", "not installed"))
+    assert cli.main(["apply", "updates"]) == cli.EXIT_ABORT
+    assert not target.exists()
+
+
+def test_apply_dry_run_is_unaffected_by_the_abort_code(
+    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from lhm.modules import updates
+
+    target = tmp_path / "51-lhm"
+    monkeypatch.setattr(updates, "APT_CONF", target)
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    # No TTY and no is_root: a dry-run plans and exits 0 without asking.
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr(cli, "is_root", lambda: False)
+    assert cli.main(["apply", "updates", "--dry-run"]) == 0
+    assert not target.exists()

@@ -97,17 +97,23 @@ def file_change(
     old: str | None = None,
     new: str | None = None,
     link: str | None = None,
+    secret: bool = False,
 ) -> None:
     """Print one file change: ``+ path`` / ``~ path`` / ``- path`` / ``@ path``.
 
     With ``--verbose`` the content follows: full content for created/deleted,
-    a unified diff for modified, and the target for a symlink.
+    a unified diff for modified, and the target for a symlink. ``secret``
+    replaces every content/diff line with a one-line notice, so a file holding
+    a token is never echoed (its ``.bak`` content is not printed either).
     """
     if _quiet:
         return
     symbol, color = _SYMBOLS[kind]
     paintln(f"{symbol} {path}", color)
     if not _verbose:
+        return
+    if secret:
+        paintln("  (content hidden: contains a secret)")
         return
     if kind == "created" and new is not None:
         _content(new)

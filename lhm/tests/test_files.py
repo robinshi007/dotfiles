@@ -192,3 +192,29 @@ def test_append_marked_prints_created_for_missing_file(tmp_path: Path) -> None:
     finally:
         colors.set_output(None)
     assert stream.getvalue().startswith(f"\033[32m+ {target}\033[0m\n")
+
+
+def test_write_dropin_secret_hides_content_and_diff(tmp_path: Path) -> None:
+    target = tmp_path / "secret.sh"
+    target.write_text("TOKEN='old'\n", encoding="utf-8")
+    stream = _capture(verbose=True)
+    try:
+        write_dropin(target, "TOKEN='new'\n", mode=0o700, secret=True)
+    finally:
+        colors.set_output(None)
+    out = stream.getvalue()
+    assert out.startswith(f"\033[33m~ {target}\033[0m\n")
+    assert "(content hidden: contains a secret)" in out
+    assert "old" not in out and "new" not in out
+
+
+def test_write_dropin_secret_on_created_file(tmp_path: Path) -> None:
+    target = tmp_path / "secret.sh"
+    stream = _capture(verbose=True)
+    try:
+        write_dropin(target, "TOKEN='x'\n", secret=True)
+    finally:
+        colors.set_output(None)
+    out = stream.getvalue()
+    assert "(content hidden: contains a secret)" in out
+    assert "TOKEN" not in out

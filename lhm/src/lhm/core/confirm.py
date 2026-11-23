@@ -19,7 +19,7 @@ def is_root() -> bool:
 
 def bypass_requested() -> bool:
     """True only for the exact value ``1`` (typos must not disable the gate)."""
-    return os.environ.get(BYPASS_ENV, "").strip() == "1"
+    return os.environ.get(BYPASS_ENV, "") == "1"
 
 
 def confirm_twice(plan_text: Sequence[str], tty_check: bool = True) -> bool:

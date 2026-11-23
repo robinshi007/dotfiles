@@ -9,9 +9,11 @@ Safety-first design:
 - **Idempotent first** — every module probes current state; already-done steps are
   reported `SKIPPED` and need no confirmation.
 - **Double confirmation** — every non-idempotent apply shows a full plan (with
-  risks) and asks `y/N` twice. Non-interactive (no TTY) runs fail closed.
-  `LHM_CONFIRM_BYPASS=1` skips only the two prompts (documented escape hatch for
-  unattended root runs / CI).
+  risks) and asks `y/N` twice. Non-interactive (no TTY) runs fail closed and exit
+  **3** (`ABORTED`: nothing changed), never 0, so automation cannot mistake a
+  refusal for a hardened host. `LHM_CONFIRM_BYPASS=1` (exactly `1`, no padding)
+  skips only the two prompts (documented escape hatch for unattended root
+  runs / CI).
 - **Backups before edits** — any modified file is backed up first (`name.ext.bak`,
   then `.bak.1`, `.bak.2`...; existing backups are never overwritten).
 - **Drop-in configs preferred** — sshd/sysctl/systemd/audit use `.d/` drop-ins
@@ -19,7 +21,11 @@ Safety-first design:
 - **Dry-run everywhere** — `--dry-run` records a plan and executes nothing.
 - **Verify after apply** — every module validates its result (`sshd -T`,
   `ss -tlnp` actual listen port, `ufw status`, `augenrules --check`, ...) and
-  reports PASS/FAIL; sshd writes are gated by `sshd -t` with automatic rollback.
+  reports PASS/FAIL; sshd writes are gated by `sshd -t` (and `sshd -T`, including
+  `AllowUsers` covering every admin key) with automatic rollback.
+- **No secret echo** — webhook errors show only scheme + host, and `--verbose`
+  prints `(content hidden: contains a secret)` instead of the alert script (the
+  `.bak` copy and its diff are suppressed too).
 
 ## Install
 
@@ -70,9 +76,14 @@ lhm rollback FILE               # restore newest backup (double-confirmed)
    then a drop-in (`sshd_config.d/99-lhm.conf`): `Port 22345`,
    `PermitRootLogin no`, `PasswordAuthentication no`, pubkey-only auth.
    Anti-lockout: refuses to disable password auth without valid keys; disables
-   socket-activated `ssh.socket`; verifies the *actual* listening port.
+   socket-activated `ssh.socket`; verifies the *actual* listening port; if both
+   restarts fail it re-enables the socket (restoring the previous listener) and
+   rolls the drop-in back, or prints explicit console recovery steps.
 3. `firewall` — ufw: allow the current SSH port(s) and 22345/tcp *first*, then
-   `default deny incoming`, `allow outgoing`, enable.
+   `default deny incoming`, `allow outgoing`, enable. When no SSH listener can be
+   probed (`ss`/`sshd -T` missing) it refuses to continue unless you name the port
+   yourself: `lhm apply firewall --allow 22/tcp` (the explicit anti-lockout escape
+   hatch). Only `ALLOW`/`ALLOW IN` rules count, never `ALLOW FWD`.
 4. `fail2ban` — installs fail2ban + nftables (only a Recommends upstream!) and
    writes a **`jail.d/99-lhm.local` drop-in** with the sshd jail on port 22345.
    It never touches `/etc/fail2ban/jail.local`: load order is
@@ -120,7 +131,20 @@ codes). Default is `--color=auto`: color only when stdout is a TTY. `NO_COLOR`
 - `apply`: each executed command echoes as `$ cmd` in cyan; file changes print as
   `+ created` (green), `~ modified` (yellow), `- deleted` (red) and
   `@ symlink` (magenta). With `--verbose`, created/deleted changes print the full
-  content and modified ones a red/green unified diff.
+  content and modified ones a red/green unified diff — except secret-bearing files
+  (the alert script), which print `(content hidden: contains a secret)`.
+
+## Exit codes
+
+| code | meaning |
+| ---- | ------- |
+| 0 | every step OK / SKIPPED / CHANGED (or a dry-run plan) |
+| 1 | a step FAILed (rollback hints are printed) |
+| 2 | usage error (bad flags/paths) |
+| 3 | ABORTED: the confirmation was refused (no TTY or an answer other than `y`), nothing was changed |
+
+`apply all` stops at the first FAIL (1) or the first ABORTED module (3, naming
+it); modules already applied stay applied.
 
 ```sh
 lhm --color=always query all | less -R
@@ -131,7 +155,7 @@ lhm query ssh --color=never
 ## Testing
 
 ```sh
-uv run pytest -q          # 244 unit tests, fake runner — no system calls
+uv run pytest -q          # unit tests, fake runner — no system calls
 uv run ruff check
 cd integration && sudo ./run.sh   # docker-based integration suite (9 scenarios)
 ```

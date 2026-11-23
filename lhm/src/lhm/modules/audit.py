@@ -116,7 +116,7 @@ def apply_audit(runner: Runner) -> list[StepResult]:
         ]
 
     if not confirm_twice(plan):
-        return [StepResult("audit", Status.SKIPPED, "aborted; no changes made")]
+        return [StepResult("audit", Status.ABORTED, "aborted; no changes made")]
 
     results = []
     try:

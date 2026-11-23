@@ -52,11 +52,19 @@ def _read_text(path: Path) -> str | None:
         return None
 
 
-def write_dropin(path: str | Path, content: str, mode: int | None = None) -> WriteOutcome:
+def write_dropin(
+    path: str | Path,
+    content: str,
+    mode: int | None = None,
+    *,
+    secret: bool = False,
+) -> WriteOutcome:
     """Write a drop-in atomically, skipping when content is already identical.
 
     ``mode`` forces the resulting file (and its fresh backup) to that mode, so a
     secret-bearing file never lands world-readable between write and chmod.
+    ``secret`` keeps ``--verbose`` from printing the content (and the diff or
+    the deleted backup content): a secret-bearing script must not be echoed.
     """
     p = _checked_path(path)
     old = _read_text(p) if p.is_file() else None
@@ -68,7 +76,9 @@ def write_dropin(path: str | Path, content: str, mode: int | None = None) -> Wri
     _atomic_write(p, content, mode)
     if mode is not None and backup is not None:
         os.chmod(backup, mode)
-    colors.file_change("created" if old is None else "modified", p, old=old, new=content)
+    colors.file_change(
+        "created" if old is None else "modified", p, old=old, new=content, secret=secret
+    )
     return "written"
 
 

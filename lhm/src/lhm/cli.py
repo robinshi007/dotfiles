@@ -33,6 +33,10 @@ from lhm.modules import updates as updates_module
 EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_USAGE = 2
+# Nothing was applied because the user (or a non-TTY stdin) refused the
+# confirmation. Distinct from 0 (automation must not read "hardened") and from
+# 1 (nothing failed; there is nothing to roll back).
+EXIT_ABORT = 3
 
 QueryTable = tuple[list[str], list[list[str]], dict[str, Any], list[RowColor]]
 
@@ -805,6 +809,8 @@ def _run_module(name: str, runner: Runner, as_json: bool, **options: Any) -> int
         print("dry-run: no changes will be made")
     results = module.apply(runner, **options)
     print_steps(results, as_json=as_json)
+    if any(r.status is Status.ABORTED for r in results):
+        return EXIT_ABORT
     return EXIT_FAIL if any(r.status is Status.FAIL for r in results) else EXIT_OK
 
 
@@ -869,6 +875,13 @@ def _handle_apply_all(args: argparse.Namespace, runner: Runner, as_json: bool) -
         print(f"== {name} ==", flush=True)
         results = module.apply(runner, **options.get(name, {}))
         print_steps(results, as_json=as_json)
+        if any(result.status is Status.ABORTED for result in results):
+            print(
+                f"lhm: apply all aborted at '{name}' (nothing changed there; "
+                "earlier modules were already applied); exit 3",
+                file=sys.stderr,
+            )
+            return EXIT_ABORT
         if any(result.status is Status.FAIL for result in results):
             print(
                 f"lhm: apply all stopped at '{name}' (FAIL); "

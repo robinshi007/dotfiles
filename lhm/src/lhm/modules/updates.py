@@ -88,7 +88,7 @@ class UpdatesModule:
             ]
 
         if not confirm_twice(plan):
-            return [StepResult("updates", Status.SKIPPED, "aborted; no changes made")]
+            return [StepResult("updates", Status.ABORTED, "aborted; no changes made")]
 
         results: list[StepResult] = []
         try:

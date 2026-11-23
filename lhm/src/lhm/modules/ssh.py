@@ -5,6 +5,7 @@ import binascii
 import os
 import re
 import struct
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -225,7 +226,7 @@ def apply_user(runner: Runner, *, user: str, key_file: str, sudo: bool = False) 
         return results
 
     if not confirm_twice(plan):
-        return [StepResult("ssh-user", Status.SKIPPED, "aborted; no changes made")]
+        return [StepResult("ssh-user", Status.ABORTED, "aborted; no changes made")]
 
     results = []
     try:
@@ -303,6 +304,69 @@ def _restart(runner: Runner) -> str | None:
     return None
 
 
+def _recover_socket_after_restart_failure(
+    runner: Runner, socket_unit: str, results: list[StepResult]
+) -> None:
+    """Restore the listener after both ``restart ssh`` and ``restart sshd`` failed.
+
+    On Debian 12 the listener comes from the socket unit's ListenStream (default
+    22), not from sshd_config: a socket-activated sshd uses the passed fd and
+    ignores Port drop-ins. Re-enabling the socket therefore restores the
+    previously working listener even while the new drop-in is still present.
+    """
+    enabled = runner.run(["systemctl", "enable", "--now", socket_unit], check=False).ok
+    active = (
+        enabled
+        and runner.run(["systemctl", "is-active", socket_unit], check=False).stdout.strip()
+        == "active"
+    )
+    ports = checks.current_ssh_ports(runner) if active else []
+    if active and ports:
+        restored = _rollback_dropin()
+        results.append(
+            StepResult(
+                "restore ssh.socket",
+                Status.CHANGED,
+                f"enabled --now {socket_unit}; listening again on "
+                + ", ".join(f"{port}/tcp" for port in ports),
+            )
+        )
+        results.append(
+            StepResult(
+                "reload sshd",
+                Status.FAIL,
+                "restart failed for ssh and sshd; the previous socket-activated "
+                f"listener was restored and the new drop-in was rolled back ({restored})",
+            )
+        )
+        print(f"lhm: rollback hint: lhm rollback {SSHD_DROPIN}", flush=True)
+        return
+
+    restored = _rollback_dropin()
+    fallback = runner.run(["systemctl", "start", "ssh"], check=False).ok
+    results.append(
+        StepResult(
+            "restore ssh.socket",
+            Status.FAIL,
+            f"could not re-enable {socket_unit}",
+        )
+    )
+    detail = (
+        "restart failed for ssh and sshd and re-enabling the socket also failed; "
+        f"drop-in rolled back ({restored}); "
+        + ("`systemctl start ssh` succeeded" if fallback else "`systemctl start ssh` also failed")
+    )
+    results.append(StepResult("reload sshd", Status.FAIL, detail))
+    print(
+        "lhm: SSH may be DOWN: from the console run "
+        f"`systemctl enable --now {socket_unit}` (or `systemctl start ssh`), "
+        "then `ss -tlnp` to confirm a listener",
+        file=sys.stderr,
+        flush=True,
+    )
+    print(f"lhm: rollback hint: lhm rollback {SSHD_DROPIN}", flush=True)
+
+
 def _conflict_hint(keyword: str, expected: str) -> str:
     """Name earlier sshd_config.d drop-ins that set ``keyword`` to something else."""
     names: list[str] = []
@@ -334,7 +398,9 @@ def _conflict_hint(keyword: str, expected: str) -> str:
     )
 
 
-def _effective_problems(config: dict[str, str], port: int) -> list[str]:
+def _effective_problems(
+    config: dict[str, str], port: int, required_users: Sequence[str] = ()
+) -> list[str]:
     problems: list[str] = []
     if config.get("port") != str(port):
         problems.append(f"port {config.get('port', 'unknown')}")
@@ -342,6 +408,13 @@ def _effective_problems(config: dict[str, str], port: int) -> list[str]:
         problems.append(f"permitrootlogin {config.get('permitrootlogin', 'unknown')}")
     if config.get("passwordauthentication") != "no":
         problems.append(f"passwordauthentication {config.get('passwordauthentication', 'unknown')}")
+    # The template writes AllowUsers, but an earlier drop-in wins first-match. An
+    # empty effective AllowUsers means "everyone may log in" (no problem).
+    allowed = set(config.get("allowusers", "").split())
+    missing = [name for name in required_users if name not in allowed]
+    if allowed and missing:
+        effective = " ".join(sorted(allowed))
+        problems.append(f"allowusers missing {', '.join(missing)} (effective: {effective})")
     return problems
 
 
@@ -383,10 +456,12 @@ def ensure_privsep_dir() -> bool:
     return True
 
 
-def _verify_hardening(runner: Runner, port: int) -> StepResult:
+def _verify_hardening(
+    runner: Runner, port: int, required_users: Sequence[str] = ()
+) -> StepResult:
     ensure_privsep_dir()
     config = checks.sshd_effective_config(runner)
-    problems = _effective_problems(config, port)
+    problems = _effective_problems(config, port, required_users)
     if problems:
         return StepResult("verify", Status.FAIL, "sshd -T: " + ", ".join(problems))
     listening = checks.listening_tcp_ports(runner)
@@ -485,11 +560,11 @@ def apply_hardening(
         ensure_privsep_dir()
         return [
             StepResult(f"write {SSHD_DROPIN}", Status.SKIPPED, "already current"),
-            _verify_hardening(runner, port),
+            _verify_hardening(runner, port, names),
         ]
 
     if not confirm_twice(plan):
-        return [StepResult("ssh-hardening", Status.SKIPPED, "aborted; no changes made")]
+        return [StepResult("ssh-hardening", Status.ABORTED, "aborted; no changes made")]
 
     results: list[StepResult] = []
     try:
@@ -515,7 +590,7 @@ def apply_hardening(
         # first-obtained-value-wins: an earlier 50-cloud-init.conf can silently
         # override the 99- drop-in, so gate on the effective config BEFORE reload.
         effective = checks.sshd_effective_config(runner)
-        conflicts = _effective_problems(effective, port)
+        conflicts = _effective_problems(effective, port, names)
         if conflicts:
             restored = _rollback_dropin()
             detail = _conflict_detail(conflicts) + f"; {restored}"
@@ -538,6 +613,9 @@ def apply_hardening(
             unit = _reload(runner)
             action = "reloaded"
         if unit is None:
+            if socket_unit is not None:
+                _recover_socket_after_restart_failure(runner, socket_unit, results)
+                return results
             results.append(
                 StepResult(
                     "reload sshd",
@@ -552,7 +630,7 @@ def apply_hardening(
         print(f"lhm: rollback hint: lhm rollback {SSHD_DROPIN}", flush=True)
         return results
 
-    results.append(_verify_hardening(runner, port))
+    results.append(_verify_hardening(runner, port, names))
     return results
 
 

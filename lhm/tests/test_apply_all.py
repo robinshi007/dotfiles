@@ -104,6 +104,14 @@ def test_apply_all_runs_modules_in_order(
             archive.with_name(archive.name + ".sha256").write_text("x\n", encoding="utf-8")
         if cmd[:4] == ["systemctl", "show", "-p", "LoadState"]:
             return subprocess.CompletedProcess(cmd, 0, "loaded\n", "")
+        if cmd == ["ss", "-tlnp"]:
+            # A hardened host: sshd already listens on 22345 (anti-lockout probe).
+            out = (
+                "State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process\n"
+                'LISTEN 0      128          0.0.0.0:22345      0.0.0.0:*     '
+                'users:(("sshd",pid=1,fd=3))\n'
+            )
+            return subprocess.CompletedProcess(cmd, 0, out, "")
         if cmd[:2] == ["dpkg-query", "-W"]:
             return subprocess.CompletedProcess(cmd, 1, "", "not installed")
         if cmd[:2] == ["sysctl", "-n"]:
@@ -231,3 +239,24 @@ def test_apply_alert_requires_webhook_flag() -> None:
         cli.main(["apply", "alert"])
     with pytest.raises(SystemExit):
         cli.main(["apply", "backup"])
+
+
+def test_apply_all_abort_stops_and_exits_3(
+    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[str] = []
+
+    def fake_apply(self: Any, runner: Runner, **options: object) -> list[StepResult]:
+        calls.append(self.name)
+        if self.name == "firewall":
+            return [StepResult("firewall", Status.ABORTED, "aborted; no changes made")]
+        return [StepResult(self.name, Status.OK)]
+
+    monkeypatch.setattr(cli, "is_root", lambda: True)
+    monkeypatch.setattr(cli, "Runner", lambda **kw: Runner(exec_fn=fake_exec, **kw))
+    for module in MODULES:
+        monkeypatch.setattr(type(module), "apply", fake_apply, raising=False)
+    rc = cli.main(["apply", "all", "--webhook", "https://x/y", "--target", "/tmp/b"])
+    assert rc == cli.EXIT_ABORT
+    assert calls == ["updates", "firewall"]
+    assert "aborted at 'firewall'" in capsys.readouterr().err

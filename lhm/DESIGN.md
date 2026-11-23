@@ -74,25 +74,50 @@ or the dry-run guarantee.
    is active it owns the listener (Port 22), so the drop-in's Port is ignored while
    `sshd -T` still reports 22345. Disable it (`systemctl disable --now ssh.socket`)
    and restart `ssh|sshd` (reload cannot move a socket unit). Verify the ACTUAL
-   listening port with `ss -tlnp`, not only `sshd -T`.
+   listening port with `ss -tlnp`, not only `sshd -T`. If both restarts fail,
+   recovery is mandatory: re-enable the socket (`systemctl enable --now
+   ssh.socket`), confirm it is active and `ss -tlnp` shows a listener again, then
+   roll the drop-in back and FAIL. A socket-activated sshd uses the passed fd and
+   ignores Port drop-ins, so the socket restores the previous listener even with
+   the new drop-in still present. If re-enabling the socket also fails, roll the
+   drop-in back, try `systemctl start ssh`, and FAIL with explicit console
+   recovery instructions (never leave the host silently without a listener).
+   The `sshd -T` gate also covers `AllowUsers`: a non-empty effective value must
+   contain every admin user that has an authorized key, otherwise reloading would
+   lock them out (an empty value means everyone may log in).
 5. Firewall order: probe the ports sshd listens on NOW (`ss -tlnp`, fallback
    `sshd -T`), allow every current SSH port AND 22345/tcp BEFORE
    `default deny incoming` + `enable`. A server still on port 22 (or `apply all`
-   with only ssh-user done) must keep its current port open.
+   with only ssh-user done) must keep its current port open. When no listener can
+   be probed AND no `--allow` was given, FAIL closed before running any `ufw`
+   command (default deny would lock the host out); `--allow PORT/PROTO` is the
+   explicit escape hatch. Only `ALLOW`/`ALLOW IN` rules satisfy the inbound
+   check: `ALLOW FWD` is a forward rule and must not read as "port allowed".
 6. Verify after every module (sshd -T grep, ss -tlnp listening port, ufw status
    verbose, sysctl spot checks, systemd-analyze security, augenrules --check,
    fail2ban-client status, plus `fail2ban-client get sshd bantime` and
    `fail2ban-client -d` for `bantime.increment`; unprobeable checks report
-   SKIPPED, not FAIL). Any FAIL => non-zero exit + rollback hint.
+   SKIPPED, not FAIL). Any FAIL => non-zero exit + rollback hint. Exit codes:
+   0 = all steps OK/SKIPPED/CHANGED, 1 = a step FAILed, 2 = usage error, 3 =
+   ABORTED (the user or a non-TTY stdin refused the confirmation: nothing was
+   changed, so automation must not read 0 as "hardened"). `apply all` stops at the
+   first FAIL (exit 1) or the first ABORTED module (exit 3, naming it).
    A sandbox drop-in whose `systemctl restart` fails is rolled back automatically
    (restore newest `.bak`, else delete) and the step FAILs; ssh's
    ProtectHome=read-only keeps `/home/*/.ssh/authorized_keys` readable.
 7. Secrets: the alert script embeds the webhook URL, so it is installed 0700
    root:root and its `.bak` keeps 0700; unit files never contain the URL. Shell
    template values are single-quoted, so values with `'` or control characters are
-   refused, not escaped. Backup target: 0700 dir, `umask 077` (archives 0600),
-   refuse `/`, `/home...`, `/etc...` (tar would ingest the growing archive); a tar
-   failure removes the partial archive and exits 1 instead of passing verify.
+   refused, not escaped. Error messages and plans only echo the webhook's scheme +
+   host, never its path/query; `--verbose` prints "(content hidden: contains a
+   secret)" instead of the script (the `.bak` content and the diff are suppressed
+   too). The URL is never passed as argv: alerts only call `systemctl`.
+   Backup target: 0700 dir, `umask 077` (archives 0600), refuse `/`, `/home...`,
+   `/etc...` (tar would ingest the growing archive) — checked after resolving
+   `//etc` and symlinked parents — and refuse any character outside
+   `[A-Za-z0-9/_.-]` (a space would split systemd's `ReadWritePaths=`, `%` is a
+   specifier); a tar failure removes the partial archive and exits 1 instead of
+   passing verify.
 8. Audit immutability is observed, not assumed: an `augenrules --load` failure on
    an identical rules file is a warning only when `auditctl -s` reports `enabled 2`,
    otherwise FAIL. `lhm rollback` is a non-idempotent write: root + TTY +
