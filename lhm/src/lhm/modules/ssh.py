@@ -32,7 +32,28 @@ from lhm.core.runner import CommandError, Runner
 from lhm.modules import ssh_auth, ssh_session, ssh_watchdog
 
 TEMPLATE = "ssh-hardening.conf.tmpl"
+# First shipped layout, before the explicit authentication and key-path settings.
+_LEGACY_TEMPLATE = """# ===== lhm ssh hardening drop-in =====
+# Managed by lhm. Remove this file to revert. sshd_config.d drop-ins take
+# precedence over the main sshd_config (first obtained value wins).
+Port {port}
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+MaxAuthTries 3
+MaxSessions 4
+ClientAliveInterval 300
+ClientAliveCountMax 2
+LoginGraceTime 30
+AllowUsers {allow_users}
+"""
 SSHD_DROPIN = Path("/etc/ssh/sshd_config.d/99-lhm.conf")
+_SSHD_DROPIN_UID = 0
 HOME_ROOT = Path("/home")
 # sshd(8) refuses to run (-t/-T) when its privilege-separation directory is
 # missing. ssh.service creates it via RuntimeDirectory, but with socket
@@ -288,13 +309,6 @@ def _import_pubkey(runner: Runner, path: str) -> str:
     return _parse_pubkey(text)
 
 
-def _read_text(path: Path) -> str | None:
-    try:
-        return path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-
-
 def _has_login_key(runner: Runner, account: userkeys.Account) -> bool:
     state = userkeys.probe_keys(runner, account)
     return (
@@ -304,6 +318,22 @@ def _has_login_key(runner: Runner, account: userkeys.Account) -> bool:
         and (state.keys_mode & 0o022) == 0
         and any(is_pubkey_line(line) for line in (state.content or "").split("\n"))
     )
+
+
+def _require_account_key(
+    runner: Runner, name: str, *, expected: userkeys.Account | None = None
+) -> userkeys.Account:
+    try:
+        account = userkeys.lookup_account(runner, name)
+        if expected is not None and account != expected:
+            raise SshError("account identity changed")
+        if account is None:
+            raise SshError("account not found")
+        if not _has_login_key(runner, account):
+            raise SshError("no valid authorized_keys in a private .ssh directory")
+    except (SshError, userkeys.UserKeysError) as exc:
+        raise SshError(f"refusing {name}: {exc} (run apply ssh-user first)") from exc
+    return account
 
 
 def _accounts_with_keys(runner: Runner) -> list[userkeys.Account]:
@@ -334,6 +364,26 @@ def users_with_keys(runner: Runner) -> list[str]:
 
 def desired_conf(port: int = DEFAULT_PORT, allow_users: Sequence[str] = ()) -> str:
     return render_template(TEMPLATE, port=str(port), allow_users=" ".join(allow_users))
+
+
+def _managed_allow_users(snapshot: bytes) -> list[str]:
+    try:
+        text = snapshot.decode("utf-8")
+    except UnicodeDecodeError:
+        raise SshError(f"refusing SSH drop-in with invalid UTF-8: {SSHD_DROPIN}") from None
+    port_line = re.search(r"^Port ([0-9]{1,5})$", text, re.MULTILINE)
+    users_line = re.search(r"^AllowUsers (.+)$", text, re.MULTILINE)
+    if port_line and users_line:
+        port = int(port_line[1])
+        names = users_line[1].split(" ")
+        if 1 <= port <= 65535 and all(USER_RE.fullmatch(name) for name in names):
+            # A full comparison rejects extra directives, Match blocks and hand edits.
+            if text in (
+                desired_conf(port, names),
+                _LEGACY_TEMPLATE.format(port=port, allow_users=" ".join(names)),
+            ):
+                return names
+    raise SshError(f"refusing to overwrite unrecognized SSH drop-in: {SSHD_DROPIN}")
 
 
 def _account_command(runner: Runner, argv: list[str], action: str) -> str:
@@ -1150,7 +1200,8 @@ def _verify_hardening(
     )
 
 
-def _dropin_snapshot(path: Path | None = None) -> bytes | None:
+def _dropin_snapshot(path: Path | None = None, *, require_trusted: bool = False) -> bytes | None:
+    """Require trusted metadata when using contents to decide what to apply."""
     path = SSHD_DROPIN if path is None else path
     if path.is_symlink():
         raise SshError(f"refusing SSH drop-in or backup symlink: {path}")
@@ -1159,9 +1210,23 @@ def _dropin_snapshot(path: Path | None = None) -> bytes | None:
     except FileNotFoundError:
         return None
     with os.fdopen(fd, "rb") as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
             raise SshError(f"refusing non-regular SSH drop-in or backup: {path}")
-        return handle.read()
+        if require_trusted and (info.st_uid != _SSHD_DROPIN_UID or info.st_mode & 0o022):
+            raise SshError(
+                f"refusing SSH drop-in or backup with unsafe owner or permissions: {path}"
+            )
+        snapshot = handle.read()
+        if require_trusted:
+            after = os.fstat(fd)
+            if (after.st_uid, after.st_mode, after.st_ctime_ns) != (
+                info.st_uid,
+                info.st_mode,
+                info.st_ctime_ns,
+            ):
+                raise SshError(f"SSH drop-in or backup changed while reading: {path}")
+        return snapshot
 
 
 def _hardening_preflight(
@@ -1568,29 +1633,23 @@ def apply_hardening(
         return [
             StepResult("ssh-hardening", Status.FAIL, "invalid user name(s): " + ", ".join(invalid))
         ]
+    try:
+        snapshot = _dropin_snapshot(require_trusted=True)
+        retained = _managed_allow_users(snapshot) if snapshot is not None else []
+    except (OSError, SshError) as exc:
+        return [StepResult("ssh-hardening", Status.FAIL, str(exc))]
+    requested = list(dict.fromkeys([*retained, *requested]))
 
     dry_run = runner.dry_run or not mutations_allowed()
     accounts: list[userkeys.Account] = []
     if dry_run:
-        candidates = f" for {' '.join(dict.fromkeys(requested))}" if requested else ""
-        users_plan = f"key validation{candidates} deferred until live apply"
+        candidates = " ".join(requested) if requested else "discover users with valid keys"
+        users_plan = f"{candidates} (key validation deferred until live apply)"
     elif requested:
-        for name in dict.fromkeys(requested):
-            try:
-                account = userkeys.lookup_account(runner, name)
-                if account is None:
-                    raise SshError("account not found")
-                if not _has_login_key(runner, account):
-                    raise SshError("no valid authorized_keys in a private .ssh directory")
-                accounts.append(account)
-            except (SshError, userkeys.UserKeysError) as exc:
-                return [
-                    StepResult(
-                        "ssh-hardening",
-                        Status.FAIL,
-                        f"refusing {name}: {exc} (run apply ssh-user first)",
-                    )
-                ]
+        try:
+            accounts = [_require_account_key(runner, name) for name in requested]
+        except SshError as exc:
+            return [StepResult("ssh-hardening", Status.FAIL, str(exc))]
     else:
         accounts = _accounts_with_keys(runner)
         if not accounts:
@@ -1603,36 +1662,48 @@ def apply_hardening(
                 )
             ]
 
-    names = [account.name for account in accounts]
+    names = requested if dry_run else [account.name for account in accounts]
     if not dry_run:
         users_plan = " ".join(names)
     desired = desired_conf(port, names)
-    try:
-        snapshot = _dropin_snapshot()
-    except (OSError, SshError) as exc:
-        return [StepResult("ssh-hardening", Status.FAIL, str(exc))]
-    needed = dry_run or snapshot != desired.encode("utf-8")
+    needed = snapshot != desired.encode("utf-8")
     plan = [
         "Plan (ssh-hardening):",
         f"  - allowed users: {users_plan}",
-        (
-            f"  - write {SSHD_DROPIN} (Port {port}, PermitRootLogin no, PasswordAuthentication no)"
-            if needed
-            else f"  - {SSHD_DROPIN} already current (skip)"
-        ),
-        "  - gate: sshd -t must accept the drop-in before any reload",
-        "  - gate: sshd -T effective values must match (earlier drop-ins win)",
-        "  - gate: sshd -T -C checks per-admin authorized_keys and public-key authentication",
-        "  - if an SSH socket is active: stop it, transfer enablement, then restart its service",
-        "  - else reload only the confirmed active SSH service",
-        "  - verify: port must actually listen (ss -tlnp), not just sshd -T",
-        "  - a systemd watchdog rolls back unless a new SSH session confirms the change",
-        "  - risk: password logins stop; keep this session open and test key login first",
     ]
+    if needed:
+        plan.extend(
+            [
+                f"  - write {SSHD_DROPIN} "
+                f"(Port {port}, PermitRootLogin no, PasswordAuthentication no)",
+                "  - gate: sshd -t must accept the drop-in before any reload",
+                "  - gate: sshd -T effective values must match (earlier drop-ins win)",
+                "  - gate: sshd -T -C checks per-admin authorized_keys and public-key auth",
+                "  - if an SSH socket is active: stop it, transfer enablement, restart its service",
+                "  - else reload only the confirmed active SSH service",
+                "  - verify: port must actually listen (ss -tlnp), not just sshd -T",
+                "  - a systemd watchdog rolls back unless a new SSH session confirms the change",
+                "  - risk: password logins stop; keep this session open and test key login first",
+            ]
+        )
+    else:
+        plan.extend(
+            [
+                f"  - {SSHD_DROPIN} already current (skip)",
+                "  - verify: effective SSH settings, managed keys and listening port",
+            ]
+        )
 
     if dry_run:
         for line in plan:
             print(line)
+        if not needed:
+            runner.run(["sshd", "-T"])
+            runner.run(["ss", "-tlnp"])
+            return [
+                StepResult(f"write {SSHD_DROPIN}", Status.SKIPPED, "already current"),
+                StepResult("verify", Status.PLANNED, "effective config, managed keys and listener"),
+            ]
         runner.run(["sshd", "-t"])
         # Detection is impossible in dry-run: show the worst case (socket unit).
         runner.run(["systemctl", "stop", "--job-mode=fail", SOCKET_UNITS[0]])
@@ -1640,11 +1711,7 @@ def apply_hardening(
         runner.run(["systemctl", "restart", "--job-mode=fail", SERVICE_UNITS[0]])
         runner.run(["ss", "-tlnp"])
         return [
-            StepResult(
-                f"write {SSHD_DROPIN}",
-                Status.PLANNED if needed else Status.SKIPPED,
-                "" if needed else "already current",
-            ),
+            StepResult(f"write {SSHD_DROPIN}", Status.PLANNED),
             StepResult("sshd -t", Status.PLANNED, "gate"),
             StepResult("sshd -T effective", Status.PLANNED, "gate"),
             StepResult("sshd -T admin keys", Status.PLANNED, "scoped gate; not a login test"),
@@ -1665,8 +1732,7 @@ def apply_hardening(
             _hardening_preflight(runner)
             raise SshError(f"SSH drop-in directory must already exist: {SSHD_DROPIN.parent}")
         with locked_target(SSHD_DROPIN):
-            _require_no_watchdog(runner, clear_prepared=True)
-            locked_snapshot = _dropin_snapshot()
+            locked_snapshot = _dropin_snapshot(require_trusted=True)
             if locked_snapshot != snapshot:
                 return [
                     StepResult(
@@ -1676,10 +1742,14 @@ def apply_hardening(
                     )
                 ]
             if not needed:
+                _require_no_watchdog(runner, clear_prepared=True)
                 return [
                     StepResult(f"write {SSHD_DROPIN}", Status.SKIPPED, "already current"),
                     _verify_hardening(runner, port, accounts),
                 ]
+            for account in accounts:
+                _require_account_key(runner, account.name, expected=account)
+            _require_no_watchdog(runner, clear_prepared=True)
             return _apply_confirmed_hardening(runner, desired, port, accounts, locked_snapshot)
     except (CommandError, OSError, ValueError) as exc:
         return [StepResult("ssh-hardening", Status.FAIL, str(exc))]
@@ -1709,7 +1779,11 @@ def _apply_confirmed_hardening(
         if snapshot is None:
             # An outside writer created the target after our absent-file check.
             record(write_attempted=False)
-        if snapshot is None or _dropin_snapshot(path) != snapshot or _dropin_snapshot() != snapshot:
+        if (
+            snapshot is None
+            or _dropin_snapshot(path) != snapshot
+            or _dropin_snapshot(require_trusted=True) != snapshot
+        ):
             raise SshError("SSH drop-in changed before write; rerun to review the new plan")
         if _backup_path(path.name) != path:
             raise SshError("SSH backup is not beside the drop-in")
@@ -1733,14 +1807,14 @@ def _apply_confirmed_hardening(
             "action": "none",
         }
         _recovery_state(data)
-        if _dropin_snapshot() != snapshot:
+        if _dropin_snapshot(require_trusted=True) != snapshot:
             raise SshError("SSH drop-in changed before write; rerun to review the new plan")
         pending = ssh_watchdog.arm(runner, data)
         _require_watchdog_time(pending)
         _recovery_hint(f"SSH watchdog armed: {_confirmation_instructions(pending, port)}")
         if not ensure_privsep_dir():
             raise SshError("could not prepare /run/sshd")
-        if _dropin_snapshot() != snapshot:
+        if _dropin_snapshot(require_trusted=True) != snapshot:
             raise SshError("SSH drop-in changed before write; rerun to review the new plan")
         if snapshot is None:
             record(write_attempted=True)
@@ -1863,14 +1937,37 @@ def _apply_confirmed_hardening(
 
 def inspect(runner: Runner, *, port: int = DEFAULT_PORT) -> dict[str, object]:
     """Read-only state used by ``check``."""
-    # Unprivileged query still reports sshd state without attempting a UID/GID switch.
-    names = users_with_keys(runner) if geteuid() == 0 and not runner.dry_run else []
+    snapshot = None
+    present: bool | None
+    names: list[str] | None
+    try:
+        snapshot = _dropin_snapshot(require_trusted=True)
+        present = snapshot is not None
+        names = [] if snapshot is None else list(dict.fromkeys(_managed_allow_users(snapshot)))
+    except SshError:
+        present, names = True, None
+    except OSError:
+        present, names = None, None  # An I/O error can hide the file itself.
+    unlisted = unverified = None
+    # Unprivileged query reports the managed list without attempting a UID/GID switch.
+    if names is not None and geteuid() == 0 and not runner.dry_run and mutations_allowed():
+        key_holders = users_with_keys(runner)
+        unlisted = [name for name in key_holders if name not in names]
+        unverified = []
+        for name in names:
+            if name not in key_holders:
+                try:
+                    _require_account_key(runner, name)
+                except SshError:
+                    unverified.append(name)
     effective = checks.sshd_effective_config(runner)
     return {
         "dropin": str(SSHD_DROPIN),
-        "dropin_present": _read_text(SSHD_DROPIN) is not None,
-        "dropin_current": _read_text(SSHD_DROPIN) == desired_conf(port, names),
+        "dropin_present": present,
+        "dropin_current": bool(names) and snapshot == desired_conf(port, names).encode("utf-8"),
         "authorized_users": names,
+        "unlisted_key_holders": unlisted,
+        "unverified_managed_keys": unverified,
         "effective": {
             key: effective.get(key, "unavailable")
             for key in ("port", "permitrootlogin", "passwordauthentication")

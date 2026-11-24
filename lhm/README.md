@@ -144,6 +144,19 @@ outside that guarantee.
    Key-file operations inside the managed account's home run as that account,
    not as root. For `--key FILE`, use a public-key file readable by the invoking
    sudo user, or put it in a root-controlled directory for direct root runs.
+   For example, `lhm apply ssh-hardening --allow-user ops` adds `ops` to the
+   lhm-managed allowlist, retaining all existing names. Before applying a
+   change, lhm revalidates keys for every retained and added user after
+   confirmation. There is no removal flag. With an existing generated
+   `99-lhm.conf`, omitting the flag keeps the established
+   list without discovering more users. If the file is absent, lhm uses the
+   explicit names or, with no flag, discovers users with valid keys under
+   `/home`. lhm refuses to overwrite an unrecognized or manually edited
+   `99-lhm.conf`.
+   OpenSSH combines separate `AllowUsers` directives additively; lhm neither
+   imports names from nor rewrites other SSH configuration files.
+   `lhm query ssh` reports the managed allowlist separately from unlisted
+   key holders; neither list proves that a user can log in.
    Anti-lockout: refuses to disable password auth without valid keys; disables
    socket-activated `ssh.socket`; checks that SSH owns the actual listen port.
    On a failed check or activation, it attempts to restore the original drop-in

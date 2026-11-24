@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from lhm import cli
 from lhm.core import colors
 from lhm.core.files import locked_target
 from lhm.core.report import Status
@@ -109,7 +110,7 @@ def watchdog(monkeypatch: pytest.MonkeyPatch) -> WatchdogFake:
 
 
 @pytest.fixture
-def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     monkeypatch.delenv("SSH_CONNECTION", raising=False)
     root = tmp_path / "home"
     root.mkdir()
@@ -117,9 +118,14 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     dropin = tmp_path / "etc" / "ssh" / "sshd_config.d" / "99-lhm.conf"
     dropin.parent.mkdir(mode=0o755, parents=True)
     monkeypatch.setattr(ssh, "SSHD_DROPIN", dropin)
+    monkeypatch.setattr(ssh, "_SSHD_DROPIN_UID", os.geteuid())
     monkeypatch.setattr(ssh, "PRIVSEP_DIR", tmp_path / "run" / "sshd")
     monkeypatch.setattr(ssh, "geteuid", lambda: 1000)
-    return root
+    umask = os.umask(0o022)
+    try:
+        yield root
+    finally:
+        os.umask(umask)
 
 
 def seed_user(home: Path, name: str, key: str = PUBKEY) -> None:
@@ -609,7 +615,8 @@ def test_inspect_skips_failed_probes_and_nonstandard_discovery_homes(
         return subprocess.CompletedProcess(cmd, int(probes[-1].name == "failed"), valid_frame, "")
 
     state = ssh.inspect(Runner(exec_fn=execute))
-    assert state["authorized_users"] == ["valid"]
+    assert state["authorized_users"] == []
+    assert state["unlisted_key_holders"] == ["valid"]
     assert probes == [home / "failed", home / "valid"]
     assert all(cmd[-1] != "link" for cmd in fake_exec.calls)
 
@@ -617,6 +624,83 @@ def test_inspect_skips_failed_probes_and_nonstandard_discovery_homes(
     assert results[0].status is Status.FAIL
     assert "probe helper failed" in results[0].detail
     assert not ssh.SSHD_DROPIN.exists()
+
+
+def test_inspect_check_and_query_use_managed_order_not_key_discovery(
+    fake_exec: Any, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ssh, "geteuid", lambda: 0)
+    names = ["z-old", "ops"]
+    for name in [*names, "unlisted"]:
+        seed_user(home, name)
+    ssh.SSHD_DROPIN.write_text(ssh.desired_conf(22345, names), encoding="utf-8")
+    fake_exec.responses.append(("sshd -T", 0, SSHD_T_OK + "allowusers z-old\nallowusers ops\n", ""))
+    runner = home_runner(home, fake_exec)
+
+    state = ssh.inspect(runner)
+    assert state["dropin_current"] and state["authorized_users"] == names
+    assert state["unlisted_key_holders"] == ["unlisted"]
+    _, rows, payload, _ = cli._query_ssh(runner)
+    assert ["lhm-managed authorized users", "z-old ops"] in rows
+    assert ["unlisted key holders", "unlisted"] in rows
+    assert payload["authorized_users"] == names
+    assert payload["unlisted_key_holders"] == ["unlisted"]
+    assert cli._check_ssh(runner)[0]
+
+    (home / "z-old" / ".ssh" / "authorized_keys").unlink()
+    ok, detail = cli._check_ssh(runner)
+    assert not ok and "unverified managed SSH keys: z-old" in detail
+
+
+@pytest.mark.parametrize("case", ["absent", "hand-edit", "unsafe-permissions", "unreadable"])
+def test_inspect_check_and_query_distinguish_unknown_dropin_from_absence(
+    fake_exec: Any, home: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    monkeypatch.setattr(ssh, "geteuid", lambda: 0)
+    seed_user(home, "ops")
+    if case != "absent":
+        prior = ssh.desired_conf(22345, ["ops"])
+        if case == "hand-edit":
+            prior += "# local settings\n"
+        ssh.SSHD_DROPIN.write_text(prior, encoding="utf-8")
+        if case == "unsafe-permissions":
+            ssh.SSHD_DROPIN.chmod(0o664)
+    if case == "unreadable":
+        open_file = os.open
+
+        def deny_open(
+            path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+        ) -> int:
+            if path == ssh.SSHD_DROPIN:
+                raise PermissionError("cannot open managed drop-in")
+            return open_file(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "open", deny_open)
+    fake_exec.responses.append(("sshd -T", 0, SSHD_T_OK, ""))
+    runner = home_runner(home, fake_exec)
+
+    state = ssh.inspect(runner)
+    _, rows, payload, _ = cli._query_ssh(runner)
+    ok, detail = cli._check_ssh(runner)
+
+    assert not ok and not state["dropin_current"]
+    if case == "absent":
+        assert state["dropin_present"] is False
+        assert state["authorized_users"] == payload["authorized_users"] == []
+        assert state["unlisted_key_holders"] == payload["unlisted_key_holders"] == ["ops"]
+        assert ["99-lhm drop-in", "missing"] in rows
+        assert ["unlisted key holders", "ops"] in rows
+        assert "99-lhm drop-in missing" in detail
+    else:
+        assert state["dropin_present"] is (None if case == "unreadable" else True)
+        assert state["authorized_users"] is payload["authorized_users"] is None
+        assert state["unlisted_key_holders"] is payload["unlisted_key_holders"] is None
+        assert ["99-lhm drop-in", "unknown"] in rows
+        assert ["lhm-managed authorized users", "unknown"] in rows
+        assert ["unlisted key holders", "unknown"] in rows
+        assert "99-lhm drop-in unreadable or unrecognized" in detail
+        assert "missing" not in detail and "no lhm-managed authorized users" not in detail
+        assert all(call.cmd == ["sshd", "-T"] for call in runner.history)
 
 
 def test_hardening_can_explicitly_allow_a_nonstandard_passwd_home(
@@ -664,22 +748,24 @@ def test_hardening_rolls_back_to_previous_content(
 ) -> None:
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
     seed_user(home, "robin")
-    ssh.SSHD_DROPIN.write_text("Port 22\n", encoding="utf-8")
+    previous = ssh.desired_conf(22, ["robin"])
+    ssh.SSHD_DROPIN.write_text(previous, encoding="utf-8")
     fake_exec.responses.extend(SSH_SERVICE_ACTIVE)
     fake_exec.responses.append(("ss -tlnp", 0, SS_TLN_OLD_PORT, ""))
     fake_exec.responses.append(("sshd -t", 1, "", "bad config"))
     results = ssh.apply_hardening(home_runner(home, fake_exec), port=22345)
     assert results[1].status is Status.FAIL
     assert "restored" in results[-1].detail
-    assert ssh.SSHD_DROPIN.read_text(encoding="utf-8") == "Port 22\n"
+    assert ssh.SSHD_DROPIN.read_text(encoding="utf-8") == previous
 
 
-@pytest.mark.parametrize("previous", [None, b"Port 22\r\n# local settings\r\n"])
+@pytest.mark.parametrize("has_previous", [False, True])
 def test_hardening_recovers_interrupt_after_atomic_replace(
-    fake_exec: Any, home: Path, monkeypatch: pytest.MonkeyPatch, previous: bytes | None
+    fake_exec: Any, home: Path, monkeypatch: pytest.MonkeyPatch, has_previous: bool
 ) -> None:
     seed_user(home, "robin")
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
+    previous = ssh.desired_conf(22, ["robin"]).encode() if has_previous else None
     target = ssh.SSHD_DROPIN
     stale = target.with_suffix(".conf.bak")
     stale.write_bytes(b"stale backup")
@@ -717,7 +803,7 @@ def test_hardening_does_not_rewrite_prechange_dropin_when_replace_fails(
     seed_user(home, "robin")
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
     target = ssh.SSHD_DROPIN
-    previous = b"Port 22\r\n"
+    previous = ssh.desired_conf(22, ["robin"]).encode()
     target.write_bytes(previous)
     inode = target.stat().st_ino
     fake_exec.responses.extend([*SSH_SERVICE_ACTIVE, ("ss -tlnp", 0, SS_TLN_OLD_PORT, "")])
@@ -742,7 +828,7 @@ def test_hardening_never_overwrites_unverified_recovery_state(
     seed_user(home, "robin")
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
     target = ssh.SSHD_DROPIN
-    target.write_bytes(b"Port 22\n")
+    target.write_bytes(ssh.desired_conf(22, ["robin"]).encode())
     displaced = home / "unrelated"
     third_party = b"Port 2200\n"
     displaced.write_bytes(third_party)
@@ -897,6 +983,199 @@ def test_hardening_writes_dropin_then_reloads_and_verifies(
     assert "not a login test" in results[-1].detail
 
 
+def test_hardening_adds_requested_user_without_removing_managed_user(
+    fake_exec: Any, home: Path, monkeypatch: pytest.MonkeyPatch, watchdog: WatchdogFake
+) -> None:
+    monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
+    port = 22345
+    ssh.SSHD_DROPIN.write_text(ssh.desired_conf(port, ["old"]), encoding="utf-8")
+    for name in ("old", "ops"):
+        seed_user(home, name)
+    fake_exec.responses.extend(
+        [
+            *SSH_SERVICE_ACTIVE,
+            ("systemctl reload --job-mode=fail ssh.service", 0, "", ""),
+            ("ss -tlnp", 0, SS_TLN_OK, ""),
+        ]
+    )
+
+    def execute(cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        if cmd[:2] == ["sshd", "-T"]:
+            content = ssh.SSHD_DROPIN.read_text(encoding="utf-8")
+            allow_users = next(
+                line.split()[1:] for line in content.splitlines() if line.startswith("AllowUsers ")
+            )
+            config = SSHD_T_OK + "authorizedkeysfile .ssh/authorized_keys\n"
+            config += "".join(f"allowusers {name}\n" for name in allow_users)
+            return subprocess.CompletedProcess(cmd, 0, config, "")
+        return fake_exec(cmd, timeout)
+
+    results = ssh.apply_hardening(home_runner(home, execute), port=port, allow_users=["ops"])
+    steps = {result.name: result for result in results}
+    assert steps["reload sshd"].status is Status.CHANGED
+    assert steps["verify"].status is Status.OK
+    assert "managed key path and settings match for old, ops" in steps["verify"].detail
+    assert ssh.SSHD_DROPIN.read_text(encoding="utf-8") == ssh.desired_conf(port, ["old", "ops"])
+    assert watchdog.pending is not None and watchdog.pending.phase == "awaiting-confirm"
+    assert watchdog.pending.data["accounts"] == [
+        [name, KeyExec.uid, KeyExec.gid, str(home / name)] for name in ("old", "ops")
+    ]
+
+
+@pytest.mark.parametrize("requested", [[], ["old", "old"]])
+def test_hardening_keeps_existing_allowlist_without_rewriting(
+    fake_exec: Any,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    watchdog: WatchdogFake,
+    requested: list[str],
+) -> None:
+    def no_prompt(_plan: list[str]) -> bool:
+        pytest.fail("unchanged configuration must not prompt")
+
+    monkeypatch.setattr(ssh, "confirm_once", no_prompt)
+    for name in ("old", "ops"):
+        seed_user(home, name)
+    prior = ssh.desired_conf(22345, ["old"])
+    ssh.SSHD_DROPIN.write_text(prior, encoding="utf-8")
+    other = ssh.SSHD_DROPIN.with_name("50-local.conf")
+    other.write_text("AllowUsers ops\n", encoding="utf-8")
+    inode = ssh.SSHD_DROPIN.stat().st_ino
+    effective = SSHD_T_OK + "allowusers old\nallowusers ops\n"
+    fake_exec.responses.extend(
+        [
+            ("sshd -T -C", 0, effective + "authorizedkeysfile .ssh/authorized_keys\n", ""),
+            ("sshd -T", 0, effective, ""),
+            ("ss -tlnp", 0, SS_TLN_OK, ""),
+        ]
+    )
+
+    results = ssh.apply_hardening(home_runner(home, fake_exec), allow_users=requested)
+
+    assert [step.status for step in results] == [Status.SKIPPED, Status.OK]
+    assert "managed key path and settings match for old;" in results[-1].detail
+    assert ssh.SSHD_DROPIN.read_text(encoding="utf-8") == prior
+    assert ssh.SSHD_DROPIN.stat().st_ino == inode
+    assert other.read_text(encoding="utf-8") == "AllowUsers ops\n"
+    assert watchdog.arms == 0
+
+
+@pytest.mark.parametrize("key", [None, "not a public key"])
+def test_hardening_refuses_missing_or_invalid_retained_key(
+    fake_exec: Any, home: Path, watchdog: WatchdogFake, key: str | None
+) -> None:
+    prior = ssh.desired_conf(22345, ["old"])
+    ssh.SSHD_DROPIN.write_text(prior, encoding="utf-8")
+    seed_user(home, "old", key if key is not None else PUBKEY)
+    if key is None:
+        (home / "old" / ".ssh" / "authorized_keys").unlink()
+    seed_user(home, "ops")
+
+    results = ssh.apply_hardening(home_runner(home, fake_exec), allow_users=["ops"])
+
+    assert results[0].status is Status.FAIL
+    assert "refusing old: no valid authorized_keys" in results[0].detail
+    assert ssh.SSHD_DROPIN.read_text(encoding="utf-8") == prior
+    assert fake_exec.calls == [] and watchdog.arms == 0
+
+
+@pytest.mark.parametrize(
+    ("content", "detail"),
+    [
+        (b"Port 22345\nAllowUsers old\n", "unrecognized SSH drop-in"),
+        (b"{base}AllowUsers old\nAllowUsers ops\n", "unrecognized SSH drop-in"),
+        (b"{base}Match User old\n    AllowUsers old\n", "unrecognized SSH drop-in"),
+        (b"{base}AllowUsers old@host *\n", "unrecognized SSH drop-in"),
+        (b"{base}AllowUsers old\nAllowGroups ops\n", "unrecognized SSH drop-in"),
+        (b"{base}AllowUsers old\n# local settings\n", "unrecognized SSH drop-in"),
+        (b"{base}AllowUsers old\xff\n", "invalid UTF-8"),
+    ],
+)
+def test_hardening_refuses_unrecognized_prior_dropin(
+    fake_exec: Any,
+    home: Path,
+    watchdog: WatchdogFake,
+    content: bytes,
+    detail: str,
+) -> None:
+    base = ssh.desired_conf(22345, ["old"]).removesuffix("AllowUsers old\n").encode()
+    prior = content.replace(b"{base}", base)
+    ssh.SSHD_DROPIN.write_bytes(prior)
+    seed_user(home, "ops")
+    runner = home_runner(home, fake_exec)
+
+    results = ssh.apply_hardening(runner, allow_users=["ops"])
+
+    assert results[0].status is Status.FAIL and detail in results[0].detail
+    assert ssh.SSHD_DROPIN.read_bytes() == prior
+    assert runner.history == [] and watchdog.arms == 0
+
+
+def test_hardening_refuses_unreadable_prior_dropin(
+    fake_exec: Any, home: Path, monkeypatch: pytest.MonkeyPatch, watchdog: WatchdogFake
+) -> None:
+    prior = ssh.desired_conf(22345, ["old"])
+    ssh.SSHD_DROPIN.write_text(prior, encoding="utf-8")
+    runner = home_runner(home, fake_exec)
+
+    def deny_open(path: Path, _flags: int) -> int:
+        assert path == ssh.SSHD_DROPIN
+        raise PermissionError("cannot read managed drop-in")
+
+    with monkeypatch.context() as context:
+        context.setattr(ssh.os, "open", deny_open)
+        results = ssh.apply_hardening(runner, allow_users=["ops"])
+
+    assert results[0].status is Status.FAIL and "cannot read managed drop-in" in results[0].detail
+    assert ssh.SSHD_DROPIN.read_text(encoding="utf-8") == prior
+    assert runner.history == [] and watchdog.arms == 0
+
+
+def test_hardening_dry_run_plans_retained_and_new_users_without_changes(
+    fake_exec: Any, home: Path, capsys: pytest.CaptureFixture[str], watchdog: WatchdogFake
+) -> None:
+    prior = ssh.desired_conf(22345, ["old"])
+    ssh.SSHD_DROPIN.write_text(prior, encoding="utf-8")
+    accounts = KeyExec(home, fake_exec)
+
+    results = ssh.apply_hardening(
+        Runner(exec_fn=accounts, dry_run=True), allow_users=["ops", "old", "ops"]
+    )
+
+    assert all(step.status is Status.PLANNED for step in results)
+    assert "allowed users: old ops (key validation deferred until live apply)" in (
+        capsys.readouterr().out
+    )
+    assert ssh.SSHD_DROPIN.read_text(encoding="utf-8") == prior
+    assert list(ssh.SSHD_DROPIN.parent.iterdir()) == [ssh.SSHD_DROPIN]
+    assert accounts.calls == [] and watchdog.arms == 0 and not ssh.PRIVSEP_DIR.exists()
+
+
+@pytest.mark.parametrize("requested", [[], ["ops", "old"]])
+def test_hardening_dry_run_only_plans_verification_when_current(
+    fake_exec: Any,
+    home: Path,
+    capsys: pytest.CaptureFixture[str],
+    watchdog: WatchdogFake,
+    requested: list[str],
+) -> None:
+    prior = ssh.desired_conf(22345, ["old", "ops"])
+    ssh.SSHD_DROPIN.write_text(prior, encoding="utf-8")
+    runner = Runner(exec_fn=KeyExec(home, fake_exec), dry_run=True)
+
+    results = ssh.apply_hardening(runner, allow_users=requested)
+
+    assert [step.status for step in results] == [Status.SKIPPED, Status.PLANNED]
+    assert results[-1].name == "verify"
+    plan = capsys.readouterr().out
+    assert "already current" in plan and "allowed users: old ops" in plan
+    assert "watchdog" not in plan and "reload" not in plan
+    assert runner.planned == [["sshd", "-T"], ["ss", "-tlnp"]]
+    assert runner.history == [] and watchdog.arms == 0
+    assert ssh.SSHD_DROPIN.read_text(encoding="utf-8") == prior
+    assert list(ssh.SSHD_DROPIN.parent.iterdir()) == [ssh.SSHD_DROPIN]
+
+
 @pytest.mark.parametrize("blocker", ["ssh.socket", "ssh.service", "unknown"])
 @pytest.mark.parametrize("before_write", [True, False])
 def test_hardening_refuses_observed_forward_jobs(
@@ -904,7 +1183,7 @@ def test_hardening_refuses_observed_forward_jobs(
 ) -> None:
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
     seed_user(home, "robin")
-    old = "Port 22\n"
+    old = ssh.desired_conf(22, ["robin"])
     ssh.SSHD_DROPIN.write_text(old, encoding="utf-8")
     socket = SocketRecoveryExec(socket_unit="sshd.socket", restart_failure=None)
     expected = old if before_write else ssh.desired_conf(22345, ["robin"])
@@ -958,7 +1237,7 @@ def test_hardening_checks_every_admin_match_before_activation_or_skipping_write(
     monkeypatch.setenv("SSH_CONNECTION", "192.0.2.1 54321 198.51.100.2 22")
     for name in ("robin", "deploy"):
         seed_user(home, name)
-    old = ssh.desired_conf(22345, ["robin", "deploy"]) if current else "Port 22\n"
+    old = ssh.desired_conf(22345 if current else 22, ["robin", "deploy"])
     ssh.SSHD_DROPIN.write_text(old, encoding="utf-8")
     scope = "host=192.0.2.1,addr=192.0.2.1,laddr=198.51.100.2,lport=22345"
     robin_cmd = f"sshd -T -C user=robin,{scope}"
@@ -1063,7 +1342,11 @@ def test_hardening_scoped_gate_uses_probed_nss_home_and_uid_and_allows_mfa(
 
 @pytest.mark.parametrize("identity", ["missing", "changed", "ambiguous"])
 def test_hardening_fails_if_discovered_account_no_longer_matches_key_snapshot(
-    identity: str, fake_exec: Any, home: Path, monkeypatch: pytest.MonkeyPatch
+    identity: str,
+    fake_exec: Any,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    watchdog: WatchdogFake,
 ) -> None:
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
     seed_user(home, "robin")
@@ -1096,13 +1379,13 @@ def test_hardening_fails_if_discovered_account_no_longer_matches_key_snapshot(
 
     results = ssh.apply_hardening(Runner(exec_fn=execute))
     steps = {step.name: step for step in results}
-    gate = steps["sshd -T admin keys"]
+    gate = steps["ssh-hardening"]
     assert gate.status is Status.FAIL
     assert "robin:" in gate.detail
     expected = "invalid passwd record" if identity == "ambiguous" else "identity changed"
     assert expected in gate.detail
     assert getent_count == 2
-    assert not any(cmd[:3] == ["sshd", "-T", "-C"] for cmd in fake_exec.calls)
+    assert fake_exec.calls == [] and watchdog.arms == 0
     assert not ssh.SSHD_DROPIN.exists()
 
 
@@ -1304,7 +1587,7 @@ def test_hardening_recovers_service_when_post_mutation_listener_probe_is_unavail
 ) -> None:
     seed_user(home, "robin")
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
-    old = "Port 22\n"
+    old = ssh.desired_conf(22, ["robin"])
     ssh.SSHD_DROPIN.write_text(old, encoding="utf-8")
     reloads: list[str] = []
 
@@ -1336,7 +1619,26 @@ def test_hardening_requires_successful_reload_to_verify_same_port_recovery(
 ) -> None:
     seed_user(home, "robin")
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
-    old = "Port 22345\nPasswordAuthentication yes\n"
+    # From 97511b0:lhm/templates/ssh-hardening.conf.tmpl, with values substituted.
+    old = """# ===== lhm ssh hardening drop-in =====
+# Managed by lhm. Remove this file to revert. sshd_config.d drop-ins take
+# precedence over the main sshd_config (first obtained value wins).
+Port 22345
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+MaxAuthTries 3
+MaxSessions 4
+ClientAliveInterval 300
+ClientAliveCountMax 2
+LoginGraceTime 30
+AllowUsers robin
+"""
     ssh.SSHD_DROPIN.write_text(old, encoding="utf-8")
     validated: list[str] = []
     reloads: list[str] = []
@@ -1385,7 +1687,7 @@ def test_hardening_recovers_only_previously_active_service(
 ) -> None:
     seed_user(home, "robin")
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
-    old = "Port 22\n# local settings\n"
+    old = ssh.desired_conf(22, ["robin"])
     ssh.SSHD_DROPIN.write_text(old, encoding="utf-8")
     actions: list[tuple[str, str]] = []
 
@@ -1436,7 +1738,7 @@ def test_hardening_leaves_standalone_service_untouched_after_dropin_rollback_exc
 ) -> None:
     seed_user(home, "robin")
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
-    ssh.SSHD_DROPIN.write_text("Port 22\n", encoding="utf-8")
+    ssh.SSHD_DROPIN.write_text(ssh.desired_conf(22, ["robin"]), encoding="utf-8")
 
     def fail_rollback(path: Path, *, backup: Path) -> Path:
         raise OSError("rollback failed")
@@ -2014,7 +2316,7 @@ def test_hardening_recovers_socket_after_final_admin_probe_failure(
 ) -> None:
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
     seed_user(home, "robin")
-    old = "Port 22\n"
+    old = ssh.desired_conf(22, ["robin"])
     ssh.SSHD_DROPIN.write_text(old, encoding="utf-8")
     socket = SocketRecoveryExec(restart_failure=None, migrated_listeners=(0, SS_TLN_OK))
     probes = 0
@@ -2047,7 +2349,7 @@ def test_hardening_preserves_only_live_daemon_when_disk_and_socket_recovery_are_
 ) -> None:
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
     seed_user(home, "robin")
-    ssh.SSHD_DROPIN.write_text("Port 22\n", encoding="utf-8")
+    ssh.SSHD_DROPIN.write_text(ssh.desired_conf(22, ["robin"]), encoding="utf-8")
     socket = SocketRecoveryExec(
         restart_failure=None,
         migrated_listeners=(0, SS_TLN_OK),
@@ -2175,7 +2477,7 @@ def test_hardening_checks_socket_despite_dropin_rollback_exception(
 ) -> None:
     seed_user(home, "robin")
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
-    ssh.SSHD_DROPIN.write_text("Port 22\n", encoding="utf-8")
+    ssh.SSHD_DROPIN.write_text(ssh.desired_conf(22, ["robin"]), encoding="utf-8")
 
     def fail_rollback(path: Path, *, backup: Path) -> Path:
         raise OSError("rollback failed")
@@ -2488,11 +2790,12 @@ def test_hardening_refuses_stale_identical_snapshot_without_verifying(
 
 
 def test_hardening_refuses_stale_config_after_confirmation(
-    fake_exec: Any, home: Path, monkeypatch: pytest.MonkeyPatch
+    fake_exec: Any, home: Path, monkeypatch: pytest.MonkeyPatch, watchdog: WatchdogFake
 ) -> None:
     seed_user(home, "robin")
-    ssh.SSHD_DROPIN.write_text("Port 22\n", encoding="utf-8")
-    concurrent_config = ssh.desired_conf(22346, ["robin"])
+    seed_user(home, "ops")
+    ssh.SSHD_DROPIN.write_text(ssh.desired_conf(22345, ["robin"]), encoding="utf-8")
+    concurrent_config = ssh.desired_conf(22345, ["robin", "other"])
 
     def confirm(plan: list[str]) -> bool:
         with locked_target(ssh.SSHD_DROPIN):
@@ -2500,12 +2803,102 @@ def test_hardening_refuses_stale_config_after_confirmation(
         return True
 
     monkeypatch.setattr(ssh, "confirm_once", confirm)
-    results = ssh.apply_hardening(home_runner(home, fake_exec))
+    results = ssh.apply_hardening(home_runner(home, fake_exec), allow_users=["ops"])
     assert results[0].status is Status.FAIL
     assert "changed during confirmation" in results[0].detail
     assert ssh.SSHD_DROPIN.read_text(encoding="utf-8") == concurrent_config
     assert not ssh.PRIVSEP_DIR.exists()
     assert fake_exec.calls == []
+    assert watchdog.arms == 0
+
+
+@pytest.mark.parametrize("name", ["old", "ops"])
+def test_hardening_refuses_key_deleted_during_confirmation(
+    fake_exec: Any, home: Path, monkeypatch: pytest.MonkeyPatch, watchdog: WatchdogFake, name: str
+) -> None:
+    for user in ("old", "ops"):
+        seed_user(home, user)
+    prior = ssh.desired_conf(22345, ["old"])
+    ssh.SSHD_DROPIN.write_text(prior, encoding="utf-8")
+    inode = ssh.SSHD_DROPIN.stat().st_ino
+
+    def confirm(_plan: list[str]) -> bool:
+        (home / name / ".ssh" / "authorized_keys").unlink()
+        return True
+
+    monkeypatch.setattr(ssh, "confirm_once", confirm)
+    results = ssh.apply_hardening(home_runner(home, fake_exec), allow_users=["ops"])
+
+    assert results[0].status is Status.FAIL
+    assert f"refusing {name}: no valid authorized_keys" in results[0].detail
+    assert ssh.SSHD_DROPIN.read_text(encoding="utf-8") == prior
+    assert ssh.SSHD_DROPIN.stat().st_ino == inode
+    assert not list(ssh.SSHD_DROPIN.parent.glob("*.bak*"))
+    assert fake_exec.calls == [] and watchdog.arms == 0 and not ssh.PRIVSEP_DIR.exists()
+
+
+@pytest.mark.parametrize("unsafe", ["owner", "group-write", "world-write"])
+@pytest.mark.parametrize("when", ["initial", "while-reading", "confirmation"])
+def test_hardening_refuses_unsafe_dropin_metadata_even_when_bytes_match(
+    fake_exec: Any,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    watchdog: WatchdogFake,
+    unsafe: str,
+    when: str,
+) -> None:
+    for name in ("old", "ops"):
+        seed_user(home, name)
+    target = ssh.SSHD_DROPIN
+    prior = ssh.desired_conf(22345, ["old"])
+    target.write_text(prior, encoding="utf-8")
+    original = target.stat()
+    fstat = os.fstat
+    foreign_owner = False
+    target_reads = 0
+
+    def stat_fd(fd: int) -> os.stat_result:
+        nonlocal target_reads
+        info = fstat(fd)
+        if (info.st_dev, info.st_ino) != (original.st_dev, original.st_ino):
+            return info
+        target_reads += 1
+        if when == "while-reading" and target_reads == 2:
+            make_unsafe()
+            info = fstat(fd)
+        if foreign_owner:
+            fields = list(info)
+            fields[4] = original.st_uid + 1
+            return os.stat_result(fields)
+        return info
+
+    def make_unsafe() -> None:
+        nonlocal foreign_owner
+        if unsafe == "owner":
+            foreign_owner = True
+        else:
+            target.chmod(0o664 if unsafe == "group-write" else 0o646)
+
+    def confirm(_plan: list[str]) -> bool:
+        assert when == "confirmation"
+        make_unsafe()
+        return True
+
+    monkeypatch.setattr(os, "fstat", stat_fd)
+    monkeypatch.setattr(ssh, "confirm_once", confirm)
+    if when == "initial":
+        make_unsafe()
+    runner = home_runner(home, fake_exec)
+    results = ssh.apply_hardening(runner, allow_users=["ops"])
+
+    detail = "changed while reading" if when == "while-reading" else "unsafe owner or permissions"
+    assert results[0].status is Status.FAIL and detail in results[0].detail
+    assert target.read_text(encoding="utf-8") == prior
+    assert target.stat().st_ino == original.st_ino
+    assert fake_exec.calls == [] and watchdog.arms == 0 and not ssh.PRIVSEP_DIR.exists()
+    assert bool(runner.history) is (when == "confirmation")
+    state = ssh.inspect(runner)
+    assert state["authorized_users"] is None and not state["dropin_current"]
 
 
 def test_hardening_does_not_recover_config_changed_before_write(
@@ -2731,12 +3124,16 @@ def test_watchdog_confirmation_requires_a_valid_stored_cutoff(
     assert not ssh.SSHD_DROPIN.exists()
 
 
+@pytest.mark.parametrize("phase", ["awaiting-confirm", "failed"])
 def test_pending_watchdog_blocks_live_hardening_even_if_identical(
     awaiting_watchdog: tuple[Runner, str],
     watchdog: WatchdogFake,
     monkeypatch: pytest.MonkeyPatch,
+    phase: str,
 ) -> None:
     runner, txid = awaiting_watchdog
+    assert watchdog.pending is not None
+    watchdog.update(watchdog.pending, phase=phase)
     with monkeypatch.context() as context:
 
         def no_prompt(_plan: list[str]) -> bool:
@@ -2749,6 +3146,7 @@ def test_pending_watchdog_blocks_live_hardening_even_if_identical(
         planned = ssh.apply_hardening(Runner(dry_run=True), port=2200)
         assert all(step.status is Status.PLANNED for step in planned)
     assert watchdog.arms == 1 and watchdog.clears == 0
+    assert watchdog.pending is not None and watchdog.pending.phase == phase
 
 
 @pytest.mark.parametrize("corrupt", [False, True])
@@ -2784,18 +3182,68 @@ class ProcessLost(BaseException):
     """Bypass in-process cleanup as when the foreground process is killed."""
 
 
+def test_unchanged_hardening_clears_inert_watchdog_after_crash_before_timer(
+    fake_exec: Any, home: Path, monkeypatch: pytest.MonkeyPatch, watchdog: WatchdogFake
+) -> None:
+    seed_user(home, "robin")
+    prior = ssh.desired_conf(22345, ["robin"])
+    ssh.SSHD_DROPIN.write_text(prior, encoding="utf-8")
+    inode = ssh.SSHD_DROPIN.stat().st_ino
+    fake_exec.responses.extend(
+        [
+            *SSH_SERVICE_ACTIVE,
+            ROBIN_ADMIN_PROBE,
+            ("sshd -T", 0, SSHD_T_OK, ""),
+            ("ss -tlnp", 0, SS_TLN_OK, ""),
+        ]
+    )
+    runner = home_runner(home, fake_exec)
+    monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
+
+    def crash_before_timer(runner: Runner, data: dict[str, object]) -> ssh.ssh_watchdog.Pending:
+        watchdog.arm(runner, data)
+        watchdog.pending = watchdog.prepared
+        raise ProcessLost
+
+    monkeypatch.setattr(ssh.ssh_watchdog, "arm", crash_before_timer)
+    with pytest.raises(ProcessLost):
+        ssh.apply_hardening(runner, port=22346)
+    assert watchdog.pending is not None and watchdog.pending.phase == "prepared"
+    calls_before = len(fake_exec.calls)
+
+    def clear_under_lock(runner: Runner, pending: ssh.ssh_watchdog.Pending) -> None:
+        with pytest.raises(BlockingIOError, match="managed target is locked"):
+            with locked_target(ssh.SSHD_DROPIN):
+                pytest.fail("watchdog cleanup must hold the target lock")
+        watchdog.clear(runner, pending)
+
+    monkeypatch.setattr(ssh.ssh_watchdog, "clear", clear_under_lock)
+    results = ssh.apply_hardening(runner)
+
+    assert [step.status for step in results] == [Status.SKIPPED, Status.OK]
+    assert watchdog.pending is None and watchdog.clears == 1 and watchdog.arms == 1
+    assert fake_exec.calls[calls_before:] == [
+        ["sshd", "-T"],
+        ROBIN_ADMIN_PROBE[0].split(),
+        ["ss", "-tlnp"],
+    ]
+    assert ssh.SSHD_DROPIN.read_text(encoding="utf-8") == prior
+    assert ssh.SSHD_DROPIN.stat().st_ino == inode and not ssh.PRIVSEP_DIR.exists()
+
+
 @pytest.mark.parametrize("active", [True, False])
-@pytest.mark.parametrize("original", [None, b"Port 22\r\n# local settings\r\n"])
+@pytest.mark.parametrize("has_original", [False, True])
 def test_watchdog_recovers_a_crash_after_atomic_dropin_replace(
     fake_exec: Any,
     home: Path,
     monkeypatch: pytest.MonkeyPatch,
     watchdog: WatchdogFake,
-    original: bytes | None,
+    has_original: bool,
     active: bool,
 ) -> None:
     seed_user(home, "robin")
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
+    original = ssh.desired_conf(22, ["robin"]).encode() if has_original else None
     target = ssh.SSHD_DROPIN
     stale = target.with_suffix(".conf.bak")
     stale.write_bytes(b"unrelated backup")
@@ -2866,7 +3314,7 @@ def test_watchdog_recovers_socket_after_foreground_is_lost(
     seed_user(home, "robin")
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
     socket = SocketRecoveryExec(enabled_state=(0, "enabled-runtime"), restart_failure="timeout")
-    old = b"Port 22\n# local settings\n"
+    old = ssh.desired_conf(22, ["robin"]).encode()
     ssh.SSHD_DROPIN.write_bytes(old)
 
     def execute(cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
@@ -3114,7 +3562,7 @@ def test_hardening_does_not_replace_a_disappeared_backup_source(
 ) -> None:
     seed_user(home, "robin")
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
-    ssh.SSHD_DROPIN.write_text("Port 22\n")
+    ssh.SSHD_DROPIN.write_text(ssh.desired_conf(22, ["robin"]), encoding="utf-8")
     fake_exec.responses.extend([*SSH_SERVICE_ACTIVE, ("ss -tlnp", 0, SS_TLN_OLD_PORT, "")])
     write = ssh.write_dropin
 
@@ -3142,7 +3590,7 @@ def test_watchdog_only_reloads_the_guarded_socket_triggered_service(
     seed_user(home, "robin")
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
     socket = SocketRecoveryExec()
-    original = b"Port 22\n# old authentication settings\n"
+    original = ssh.desired_conf(22, ["robin"]).encode()
     ssh.SSHD_DROPIN.write_bytes(original)
     replace = os.replace
     update = watchdog.update

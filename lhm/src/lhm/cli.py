@@ -130,7 +130,10 @@ def build_parser() -> argparse.ArgumentParser:
                 "--port", type=int, default=ssh_module.DEFAULT_PORT, help="SSH port (default 22345)"
             )
             hardening_leaf.add_argument(
-                "--allow-user", action="append", default=[], help="allowed SSH user (repeatable)"
+                "--allow-user",
+                action="append",
+                default=[],
+                help="add a user to the lhm-managed SSH allowlist (repeatable)",
             )
             continue
         apply_name = "cleanup-services" if module.name == "services" else module.name
@@ -304,6 +307,20 @@ def _query_ssh(runner: Runner) -> QueryTable:
         None,
         Color.GREEN if state["dropin_current"] else Color.RED,
     ]
+    names, unlisted = state["authorized_users"], state["unlisted_key_holders"]
+    user_fields = {"authorized_users": names, "unlisted_key_holders": unlisted}
+    if names is None:
+        dropin_status, names_text, unlisted_text = "unknown", "unknown", "unknown"
+    else:
+        dropin_status = "current" if state["dropin_current"] else "differs"
+        if not state["dropin_present"]:
+            dropin_status = "missing"
+        names_text = " ".join(names) or "-"
+        unlisted_text = "not probed" if unlisted is None else " ".join(unlisted) or "-"
+    user_rows = [
+        ["lhm-managed authorized users", names_text],
+        ["unlisted key holders", unlisted_text],
+    ]
     if not config:
         # sshd -T reads every included file and fails without root when any of
         # them is root-only (e.g. 50-cloud-init.conf). Distinguish "cannot
@@ -311,30 +328,31 @@ def _query_ssh(runner: Runner) -> QueryTable:
         payload: dict[str, Any] = {
             "available": False,
             "note": "sshd -T failed (try: sudo lhm query ssh)",
+            **user_fields,
         }
         rows = [[key, "unavailable (needs root)"] for key in keys]
         row_colors: list[RowColor] = [[None, Color.YELLOW] for _ in keys]
-        rows.append(["99-lhm drop-in", "current" if state["dropin_current"] else "differs"])
+        rows.append(["99-lhm drop-in", dropin_status])
         row_colors.append(dropin_color)
-        rows.append(["authorized users", " ".join(state["authorized_users"]) or "-"])
-        row_colors.append(None)
+        rows.extend(user_rows)
+        row_colors.extend([None, None])
         rows.append(["hint", "run: sudo lhm query ssh"])
         row_colors.append(None)
         return ["setting", "effective value"], rows, payload, row_colors
     payload = {key: config.get(key, "unavailable") for key in keys}
     payload["dropin"] = state["dropin"]
     payload["dropin_current"] = state["dropin_current"]
-    payload["authorized_users"] = state["authorized_users"]
+    payload.update(user_fields)
     rows = [[key, payload[key]] for key in keys]
     row_colors = []
     for key in keys:
         value = payload[key]
         ok = None if value == "unavailable" else SSHD_TARGETS[key](value)
         row_colors.append([None, _judge(ok)])
-    rows.append(["99-lhm drop-in", "current" if state["dropin_current"] else "differs"])
+    rows.append(["99-lhm drop-in", dropin_status])
     row_colors.append(dropin_color)
-    rows.append(["authorized users", " ".join(state["authorized_users"]) or "-"])
-    row_colors.append(None)
+    rows.extend(user_rows)
+    row_colors.extend([None, None])
     return ["setting", "effective value"], rows, payload, row_colors
 
 
@@ -618,10 +636,21 @@ def _check_updates(runner: Runner) -> tuple[bool, str]:
 def _check_ssh(runner: Runner) -> tuple[bool, str]:
     state = ssh_module.inspect(runner)
     problems = []
-    if not state["authorized_users"]:
-        problems.append("no authorized_keys under /home")
-    if not state["dropin_current"]:
-        problems.append("99-lhm drop-in missing or differs")
+    names = state["authorized_users"]
+    unverified = state["unverified_managed_keys"]
+    if names is None:
+        problems.append("99-lhm drop-in unreadable or unrecognized")
+    else:
+        if not names:
+            problems.append("no lhm-managed authorized users")
+        elif unverified is None:
+            problems.append("managed SSH keys not probed")
+        elif unverified:
+            problems.append("unverified managed SSH keys: " + ", ".join(unverified))
+        if not state["dropin_present"]:
+            problems.append("99-lhm drop-in missing")
+        elif not state["dropin_current"]:
+            problems.append("99-lhm drop-in differs")
     effective = state["effective"]
     if effective["port"] != str(ssh_module.DEFAULT_PORT):
         problems.append(f"effective port {effective['port']}")
