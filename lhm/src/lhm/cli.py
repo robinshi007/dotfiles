@@ -42,6 +42,7 @@ EXIT_USAGE = 2
 EXIT_ABORT = 3
 
 _SSH_CONFIRM_HINT = "Run only after an independent, non-multiplexed SSH key login."
+_SSH_RECOVER_HINT = "Run from the console: your SSH connection may drop."
 
 QueryTable = tuple[list[str], list[list[str]], dict[str, Any], list[RowColor]]
 
@@ -108,6 +109,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ssh_confirm.add_argument("txid", metavar="ID", help="SSH watchdog transaction ID")
     _add_global_flags(ssh_confirm, suppress=True)
+
+    ssh_recover = commands.add_parser(
+        "ssh-recover",
+        help="recover a failed SSH watchdog transaction (root only)",
+        description=_SSH_RECOVER_HINT,
+    )
+    ssh_recover.add_argument("txid", metavar="ID", help="failed SSH watchdog transaction ID")
+    _add_global_flags(ssh_recover, suppress=True)
 
     apply_parser = commands.add_parser("apply", help="apply one module or all of them")
     apply_targets = apply_parser.add_subparsers(dest="module", required=True)
@@ -890,22 +899,39 @@ def _handle_rollback(args: argparse.Namespace, runner: Runner) -> int:
     return EXIT_OK
 
 
-def _handle_ssh_confirm(args: argparse.Namespace, runner: Runner, as_json: bool) -> int:
-    name = "ssh-confirm"
-    action = f"disarm SSH watchdog transaction {args.txid!r}"
-    if runner.dry_run:
-        results = [StepResult(name, Status.PLANNED, f"Would {action}. {_SSH_CONFIRM_HINT}")]
-    elif not is_root():
-        results = [StepResult(name, Status.FAIL, "ssh-confirm requires root")]
+def _handle_ssh_watchdog(args: argparse.Namespace, runner: Runner, as_json: bool) -> int:
+    name = args.command
+    recovering = name == "ssh-recover"
+    if recovering:
+        action = (
+            "restore pre-change SSH configuration and listeners "
+            f"for failed watchdog transaction {args.txid!r}"
+        )
+        hint = _SSH_RECOVER_HINT
     else:
-        plan = [f"Plan (ssh-confirm): {action}", f"  - {_SSH_CONFIRM_HINT}"]
-        with redirect_stdout(sys.stderr) if as_json else nullcontext():
-            confirmed = confirm_once(plan, allow_bypass=False)
+        action = f"disarm SSH watchdog transaction {args.txid!r}"
+        hint = _SSH_CONFIRM_HINT
+    if runner.dry_run:
+        results = [StepResult(name, Status.PLANNED, f"Would {action}. {hint}")]
+    elif not is_root():
+        results = [StepResult(name, Status.FAIL, f"{name} requires root")]
+    else:
+        plan = [f"Plan ({name}): {action}", f"  - {hint}"]
+        try:
+            with redirect_stdout(sys.stderr) if as_json else nullcontext():
+                confirmed = confirm_once(plan, allow_bypass=False)
+        except KeyboardInterrupt:
+            if not recovering:
+                raise
+            confirmed = False
         if not confirmed:
             results = [StepResult(name, Status.ABORTED, "confirmation not granted")]
         else:
             try:
-                results = ssh_module.confirm_watchdog(runner, args.txid)
+                if recovering:
+                    results = ssh_module.recover_failed_watchdog(runner, args.txid)
+                else:
+                    results = ssh_module.confirm_watchdog(runner, args.txid)
             except (ssh_watchdog.WatchdogError, ssh_module.SshError, CommandError, OSError) as exc:
                 results = [StepResult(name, Status.FAIL, str(exc))]
     print_steps(results, as_json=as_json)
@@ -1072,8 +1098,8 @@ def main(argv: list[str] | None = None) -> int:
                 return _handle_check(args, runner, as_json)
             if args.command == "rollback":
                 return _handle_rollback(args, runner)
-            if args.command == "ssh-confirm":
-                return _handle_ssh_confirm(args, runner, as_json)
+            if args.command in ("ssh-confirm", "ssh-recover"):
+                return _handle_ssh_watchdog(args, runner, as_json)
             return _handle_apply(args, runner, as_json)
     except NotImplementedError as exc:
         print(f"lhm: module '{exc}' not yet implemented", file=sys.stderr)

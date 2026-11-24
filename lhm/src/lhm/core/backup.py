@@ -11,7 +11,7 @@ import os
 import re
 import stat
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
@@ -96,11 +96,19 @@ def _apply_access_acl(fd: int, acl: bytes | None) -> None:
 
 
 @contextmanager
-def _stage_copy(src: Path, *, mode: int | None = None) -> Iterator[Path]:
+def _stage_copy(
+    src: Path,
+    *,
+    mode: int | None = None,
+    check_source: Callable[[os.stat_result], None] | None = None,
+    check_copy: Callable[[Path], None] | None = None,
+) -> Iterator[Path]:
     """Yield a fsynced temp file, hidden even while installing its access ACL."""
     with ExitStack() as cleanup:
         src_fd, src_stat = _open_regular(src)
         cleanup.callback(os.close, src_fd)
+        if check_source is not None:
+            check_source(src_stat)
         acl = _access_acl(src_fd)
         # Setting an ACL can unmask group permissions before fchmod applies the cap.
         # Start private, then restore owner access if a default ACL masked it.
@@ -130,7 +138,18 @@ def _stage_copy(src: Path, *, mode: int | None = None) -> Iterator[Path]:
             os.fsync(tmp_fd)
         finally:
             os.close(tmp_fd)
-        yield Path(tmp_name)
+        staged = Path(tmp_name)
+        if check_source is not None or check_copy is not None:
+            after = os.fstat(src_fd)
+            if (after.st_uid, after.st_mode, after.st_ctime_ns) != (
+                src_stat.st_uid,
+                src_stat.st_mode,
+                src_stat.st_ctime_ns,
+            ):
+                raise ValueError(f"refusing to use changing backup: {src}")
+        if check_copy is not None:
+            check_copy(staged)
+        yield staged
 
 
 def backup_file(path: str | Path, *, mode: int | None = None) -> Path:
@@ -185,12 +204,19 @@ def _validated_backup(src: Path, chosen: Path) -> Path:
     return chosen
 
 
-def rollback_file(path: str | Path, *, backup: str | Path | None = None) -> Path:
+def rollback_file(
+    path: str | Path,
+    *,
+    backup: str | Path | None = None,
+    check_source: Callable[[os.stat_result], None] | None = None,
+    check_copy: Callable[[Path], None] | None = None,
+) -> Path:
     """Restore a backup (default: the newest) over ``path`` and return it.
 
     The backup is copied to a same-filesystem temp file and swapped in with
     ``os.replace``, so the target is either the old content or the restored
-    backup, never a partial copy.
+    backup, never a partial copy. ``check_source`` checks the opened source's
+    metadata before any read; ``check_copy`` checks the staged copy before publication.
     """
     if not mutations_allowed():
         raise RuntimeError("rollback is not allowed in dry-run")
@@ -201,7 +227,7 @@ def rollback_file(path: str | Path, *, backup: str | Path | None = None) -> Path
             raise FileNotFoundError(f"no backup found for {src}")
     else:
         chosen = _validated_backup(src, _safe_path(backup))
-    with _stage_copy(chosen) as tmp:
+    with _stage_copy(chosen, check_source=check_source, check_copy=check_copy) as tmp:
         os.replace(tmp, src)
     _fsync_dir(src.parent)
     return chosen

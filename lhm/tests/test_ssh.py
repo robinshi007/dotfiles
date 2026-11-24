@@ -820,7 +820,8 @@ def test_hardening_does_not_rewrite_prechange_dropin_when_replace_fails(
 
 
 @pytest.mark.parametrize(
-    "change", ["contents", "symlink", "missing backup", "backup contents", "read failure"]
+    "change",
+    ["contents", "symlink", "missing backup", "backup contents", "read failure", "candidate mode"],
 )
 def test_hardening_never_overwrites_unverified_recovery_state(
     fake_exec: Any, home: Path, monkeypatch: pytest.MonkeyPatch, change: str
@@ -834,7 +835,7 @@ def test_hardening_never_overwrites_unverified_recovery_state(
     displaced.write_bytes(third_party)
     fake_exec.responses.extend([*SSH_SERVICE_ACTIVE, ("ss -tlnp", 0, SS_TLN_OLD_PORT, "")])
 
-    def fail_snapshot(path: Path | None = None) -> bytes | None:
+    def fail_snapshot(path: Path | None = None, *, require_trusted: bool = False) -> bytes | None:
         raise PermissionError("cannot read snapshot")
 
     def execute(cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
@@ -848,6 +849,8 @@ def test_hardening_never_overwrites_unverified_recovery_state(
                 target.with_suffix(".conf.bak").unlink()
             elif change == "read failure":
                 monkeypatch.setattr(ssh, "_dropin_snapshot", fail_snapshot)
+            elif change == "candidate mode":
+                target.chmod(0o664)
             else:
                 target.with_suffix(".conf.bak").write_bytes(third_party)
             return subprocess.CompletedProcess(cmd, 1, "", "original gate failure")
@@ -1740,7 +1743,7 @@ def test_hardening_leaves_standalone_service_untouched_after_dropin_rollback_exc
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
     ssh.SSHD_DROPIN.write_text(ssh.desired_conf(22, ["robin"]), encoding="utf-8")
 
-    def fail_rollback(path: Path, *, backup: Path) -> Path:
+    def fail_rollback(path: Path, *, backup: Path, **_options: object) -> Path:
         raise OSError("rollback failed")
 
     monkeypatch.setattr(ssh, "rollback_file", fail_rollback)
@@ -2356,7 +2359,7 @@ def test_hardening_preserves_only_live_daemon_when_disk_and_socket_recovery_are_
         cached_listen="[::]:22100 (Stream)\n",
     )
 
-    def fail_rollback(path: Path, *, backup: Path) -> Path:
+    def fail_rollback(path: Path, *, backup: Path, **_options: object) -> Path:
         raise OSError("rollback failed")
 
     monkeypatch.setattr(ssh, "rollback_file", fail_rollback)
@@ -2479,7 +2482,7 @@ def test_hardening_checks_socket_despite_dropin_rollback_exception(
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
     ssh.SSHD_DROPIN.write_text(ssh.desired_conf(22, ["robin"]), encoding="utf-8")
 
-    def fail_rollback(path: Path, *, backup: Path) -> Path:
+    def fail_rollback(path: Path, *, backup: Path, **_options: object) -> Path:
         raise OSError("rollback failed")
 
     monkeypatch.setattr(ssh, "rollback_file", fail_rollback)
@@ -3149,6 +3152,288 @@ def test_pending_watchdog_blocks_live_hardening_even_if_identical(
     assert watchdog.pending is not None and watchdog.pending.phase == phase
 
 
+def test_watchdog_confirmation_directs_failed_transaction_to_recovery(
+    awaiting_watchdog: tuple[Runner, str],
+    watchdog: WatchdogFake,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, txid = awaiting_watchdog
+    assert watchdog.pending is not None
+    failed = watchdog.update(watchdog.pending, phase="failed")
+    blocked = ssh.apply_hardening(runner, allow_users=["robin"])[0]
+
+    monkeypatch.setenv("SSH_CONNECTION", "127.0.0.1 42222 127.0.0.1 22345")
+    history = len(runner.history)
+    wrong = ssh.confirm_watchdog(runner, "b" * 32)[0]
+    result = ssh.confirm_watchdog(runner, txid)[0]
+
+    assert watchdog.pending == failed and watchdog.clears == 0
+    assert len(runner.history) == history and not watchdog.freshness_checks
+    assert wrong.status is Status.FAIL
+    assert wrong.detail == "no matching SSH watchdog transaction awaiting confirmation"
+    for failure in (blocked, result):
+        assert failure.status is Status.FAIL
+        assert "failed" in failure.detail and "recovery is required" in failure.detail
+        assert "console" in failure.detail
+        assert f"journalctl -u lhm-ssh-rollback-{txid}.service" in failure.detail
+        assert "original apply output/stderr" in failure.detail
+        assert f"lhm ssh-recover {txid}" in failure.detail
+
+
+@pytest.mark.parametrize("unsafe", ["owner", "group-write", "world-write"])
+@pytest.mark.parametrize(
+    "drift",
+    ["original", "candidate", "backup", "backup-during-copy", "before-reload", "before-clear"],
+)
+def test_watchdog_recovery_rejects_same_bytes_with_unsafe_metadata(
+    fake_exec: Any,
+    home: Path,
+    watchdog: WatchdogFake,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe: str,
+    drift: str,
+) -> None:
+    target = ssh.SSHD_DROPIN
+    original = ssh.desired_conf(22, ["robin"]).encode()
+    target.write_bytes(original)
+    target.chmod(0o600)
+    seed_user(home, "robin")
+    monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
+    fake_exec.responses.extend(
+        [
+            *SSH_SERVICE_ACTIVE,
+            ROBIN_ADMIN_PROBE,
+            ("sshd -T", 0, SSHD_T_OK, ""),
+            ("ss -tlnp", 0, SS_TLN_OK, ""),
+        ]
+    )
+    assert ssh.apply_hardening(home_runner(home, fake_exec), allow_users=["robin"])[-1].status is (
+        Status.OK
+    )
+    pending = watchdog.pending
+    assert pending is not None
+    backup = target.with_suffix(".conf.bak")
+    assert backup.read_bytes() == original
+    if drift == "original":
+        target.write_bytes(original)
+    expected = original if drift.startswith("before-") else target.read_bytes()
+    unsafe_path = backup if drift.startswith("backup") else target
+    unsafe_mode = 0o620 if unsafe == "group-write" else 0o602
+    foreign: os.stat_result | None = None
+    fstat = os.fstat
+    read = os.read
+    backup_stat = backup.stat()
+    backup_reads = 0
+
+    def make_unsafe(path: Path) -> None:
+        nonlocal foreign
+        if unsafe == "owner":
+            foreign = path.stat()
+        else:
+            path.chmod(unsafe_mode)
+
+    def stat_fd(fd: int) -> os.stat_result:
+        info = fstat(fd)
+        if foreign is not None and os.path.samestat(info, foreign):
+            return os.stat_result(
+                (*info[:4], foreign.st_uid + 1, *info[5:]),
+                {
+                    "st_atime_ns": info.st_atime_ns,
+                    "st_mtime_ns": info.st_mtime_ns,
+                    "st_ctime_ns": info.st_ctime_ns,
+                },
+            )
+        return info
+
+    def read_backup(fd: int, size: int) -> bytes:
+        nonlocal backup_reads
+        if not os.path.samestat(fstat(fd), backup_stat):
+            return read(fd, size)
+        backup_reads += 1
+        chunk = read(fd, size)
+        if chunk and drift == "backup-during-copy":
+            make_unsafe(backup)
+        return chunk
+
+    def execute(cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        if (drift, cmd) in [("before-reload", ["sshd", "-t"]), ("before-clear", ["ss", "-tlnp"])]:
+            make_unsafe(target)
+        return fake_exec(cmd, timeout)
+
+    monkeypatch.setattr(os, "fstat", stat_fd)
+    if drift in {"original", "candidate", "backup"}:
+        make_unsafe(unsafe_path)
+    if drift.startswith("backup"):
+        monkeypatch.setattr(os, "read", read_backup)
+    runner = Runner(exec_fn=execute)
+    if drift == "original":
+        monkeypatch.setattr(ssh, "Runner", lambda: runner)
+        watchdog.now = pending.deadline
+        assert ssh.expire_watchdog(pending.id) == 1
+    else:
+        watchdog.update(pending, phase="failed")
+        monkeypatch.setattr(ssh, "geteuid", lambda: 0)
+        results = ssh.recover_failed_watchdog(runner, pending.id)
+        detail = (
+            "changing backup" if drift == "backup-during-copy" else "unsafe owner or permissions"
+        )
+        assert any(result.status is Status.FAIL and detail in result.detail for result in results)
+
+    assert watchdog.pending is not None and watchdog.pending.phase == "failed"
+    assert watchdog.clears == 0
+    if drift == "backup":
+        assert backup_reads == 0
+    assert target.read_bytes() == expected and backup.read_bytes() == original
+    if unsafe == "owner":
+        assert foreign is not None and os.path.samestat(unsafe_path.stat(), foreign)
+    else:
+        assert stat.S_IMODE(unsafe_path.stat().st_mode) == unsafe_mode
+    actions = {"daemon-reload", "start", "stop", "restart", "reload", "enable", "disable"}
+    assert [log.cmd for log in runner.history if log.cmd[1] in actions] == (
+        [SSH_SERVICE_RELOAD] if drift == "before-clear" else []
+    )
+
+
+@pytest.mark.parametrize("phase", ["prepared", "armed", "failed"])
+def test_watchdog_does_not_clear_before_write_if_target_is_unsafe(
+    awaiting_watchdog: tuple[Runner, str],
+    watchdog: WatchdogFake,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    runner, txid = awaiting_watchdog
+    pending = watchdog.pending
+    assert pending is not None
+    watchdog.update(pending, phase=phase, action="none", write_attempted=False, backup=None)
+    watchdog.now = pending.deadline
+    ssh.SSHD_DROPIN.chmod(0o622)
+    history = len(runner.history)
+    monkeypatch.setattr(ssh, "Runner", lambda: runner)
+
+    assert ssh.expire_watchdog(txid) == 1
+    assert watchdog.pending is not None and watchdog.clears == 0
+    assert len(runner.history) == history
+
+
+def test_foreground_watchdog_recovery_retries_legacy_failed_transaction(
+    awaiting_watchdog: tuple[Runner, str],
+    fake_exec: Any,
+    watchdog: WatchdogFake,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, txid = awaiting_watchdog
+    pending = watchdog.pending
+    assert pending is not None
+    data = pending.data
+    del data["freshness"]  # Older v1 markers did not include a confirmation cutoff.
+    watchdog.pending = ssh.ssh_watchdog.Pending(txid, pending.deadline, pending.phase, data)
+    watchdog.now = pending.deadline
+    monkeypatch.setattr(ssh, "Runner", lambda: runner)
+    monkeypatch.setattr(ssh, "geteuid", lambda: 0)
+    fake_exec.responses.insert(0, ("ss -tlnp", 0, SS_TLN_OLD_PORT, ""))
+    assert ssh.expire_watchdog(txid) == 75
+    failed = watchdog.pending
+    assert failed is not None and failed.phase == "failed"
+    assert not ssh.SSHD_DROPIN.exists()
+
+    history = len(runner.history)
+    results = ssh.recover_failed_watchdog(runner, txid)
+
+    assert [step.status for step in results] == [Status.SKIPPED, Status.FAIL, Status.FAIL]
+    assert "previous listener not verified" in results[1].detail
+    assert "console" in results[-1].detail and "journalctl" in results[-1].detail
+    assert f"lhm ssh-recover {txid}" in results[-1].detail
+    assert watchdog.pending == failed and watchdog.clears == 0
+    assert [entry.cmd for entry in runner.history[history:]].count(SSH_SERVICE_RELOAD) == 1
+
+    fake_exec.responses.pop(0)
+    results = ssh.recover_failed_watchdog(runner, txid)
+
+    assert [step.status for step in results] == [Status.SKIPPED, Status.CHANGED, Status.CHANGED]
+    assert "original listener and enablement verified" in results[1].detail
+    assert not ssh.SSHD_DROPIN.exists()
+    assert watchdog.pending is None and watchdog.clears == 1 and watchdog.arms == 1
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("invalid", "invalid SSH watchdog transaction ID"),
+        ("mismatch", "no matching failed SSH watchdog transaction"),
+        ("awaiting-confirm", "no matching failed SSH watchdog transaction"),
+        ("armed", "no matching failed SSH watchdog transaction"),
+        ("missing", "no matching failed SSH watchdog transaction"),
+        ("non-root", "requires root"),
+        ("dry-run", "not allowed in dry-run"),
+    ],
+)
+def test_foreground_watchdog_recovery_refuses_without_a_matching_failed_marker(
+    awaiting_watchdog: tuple[Runner, str],
+    watchdog: WatchdogFake,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    expected: str,
+) -> None:
+    applied, txid = awaiting_watchdog
+    assert watchdog.pending is not None
+    phase = case if case in {"awaiting-confirm", "armed"} else "failed"
+    watchdog.update(watchdog.pending, phase=phase)
+    if case == "missing":
+        watchdog.pending = None
+    marker = watchdog.pending
+    monkeypatch.setattr(ssh, "geteuid", lambda: 1000 if case == "non-root" else 0)
+    requested = {"invalid": "../foreign", "mismatch": "b" * 32}.get(case, txid)
+    runner = Runner(dry_run=case == "dry-run", exec_fn=applied.exec_fn)
+    candidate = ssh.SSHD_DROPIN.read_bytes()
+
+    result = ssh.recover_failed_watchdog(runner, requested)[0]
+
+    assert result.status is Status.FAIL and expected in result.detail
+    assert "lhm ssh-recover " not in result.detail and "../foreign" not in result.detail
+    assert watchdog.pending == marker and watchdog.clears == 0
+    assert ssh.SSHD_DROPIN.read_bytes() == candidate
+    assert runner.history == [] and runner.planned == []
+
+
+@pytest.mark.parametrize("conflict", ["drop-in", "manifest", "worker"])
+def test_foreground_watchdog_recovery_leaves_state_untouched_on_conflict(
+    awaiting_watchdog: tuple[Runner, str],
+    watchdog: WatchdogFake,
+    monkeypatch: pytest.MonkeyPatch,
+    conflict: str,
+) -> None:
+    runner, txid = awaiting_watchdog
+    assert watchdog.pending is not None
+    failed = watchdog.update(watchdog.pending, phase="failed")
+    monkeypatch.setattr(ssh, "geteuid", lambda: 0)
+    if conflict == "drop-in":
+        ssh.SSHD_DROPIN.write_bytes(b"Port 2200\n")
+    if conflict == "manifest":
+        failed = watchdog.update(failed, endpoints=[["private-manifest-value", 22]])
+    candidate = ssh.SSHD_DROPIN.read_bytes()
+    history = len(runner.history)
+
+    if conflict == "worker":
+        monkeypatch.setattr(
+            ssh.ssh_watchdog, "current", lambda: pytest.fail("read pending marker without the lock")
+        )
+        with locked_target(ssh.SSHD_DROPIN):
+            results = ssh.recover_failed_watchdog(runner, txid)
+        assert "locked" in results[-1].detail
+    else:
+        results = ssh.recover_failed_watchdog(runner, txid)
+        if conflict == "drop-in":
+            assert "left untouched" in results[0].detail
+        else:
+            assert "invalid SSH watchdog recovery state" in results[-1].detail
+            assert all("private-manifest-value" not in step.detail for step in results)
+
+    assert results[-1].status is Status.FAIL
+    assert f"lhm ssh-recover {txid}" in results[-1].detail
+    assert watchdog.pending == failed and watchdog.clears == 0
+    assert ssh.SSHD_DROPIN.read_bytes() == candidate and len(runner.history) == history
+
+
 @pytest.mark.parametrize("corrupt", [False, True])
 def test_inert_prepared_watchdog_can_be_replaced_but_a_corrupt_record_blocks(
     awaiting_watchdog: tuple[Runner, str],
@@ -3524,6 +3809,73 @@ def test_watchdog_defers_stale_cached_socket_after_disk_io_failure(
         assert socket.socket_active and not socket.service_active
         assert not ssh.SSHD_DROPIN.exists() and watchdog.pending is None
         assert watchdog.clears == 1
+
+
+@pytest.mark.parametrize(
+    "drift", ["permissions", "foreign", "missing", "candidate", "original", "originally-absent"]
+)
+def test_watchdog_only_starts_cached_socket_with_known_dropin_after_disk_error(
+    home: Path, monkeypatch: pytest.MonkeyPatch, watchdog: WatchdogFake, drift: str
+) -> None:
+    seed_user(home, "robin")
+    monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
+    target = ssh.SSHD_DROPIN
+    had_original = drift in {"missing", "original"}
+    original = ssh.desired_conf(22, ["robin"]).encode() if had_original else None
+    if original is not None:
+        target.write_bytes(original)
+    socket = SocketRecoveryExec(restart_failure=None, migrated_listeners=(0, SS_TLN_OK))
+    assert ssh.apply_hardening(home_runner(home, socket))[-1].status is Status.OK
+    pending = watchdog.pending
+    assert pending is not None
+    watchdog.now = pending.deadline
+    socket.service_active = False
+    assert not socket.socket_active
+    socket.calls.clear()
+    candidate = target.read_bytes()
+    foreign = b"Port 2200\n"
+    known = drift in {"candidate", "original", "originally-absent"}
+
+    def fail_restore(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EIO, "injected filesystem error")
+
+    def execute(cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        if cmd == ["systemctl", "show", "--property=Listen", "--value", "ssh.socket"]:
+            if drift == "permissions":
+                target.chmod(0o664)
+            elif drift == "foreign":
+                target.write_bytes(foreign)
+            elif drift in {"missing", "originally-absent"}:
+                target.unlink(missing_ok=True)
+            elif drift == "original":
+                assert original is not None
+                target.write_bytes(original)
+        return socket(cmd, timeout)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ssh, "Runner", lambda: Runner(exec_fn=execute))
+        patch.setattr(ssh, "remove_file" if original is None else "rollback_file", fail_restore)
+        assert ssh.expire_watchdog(pending.id) == (75 if known else 1)
+    assert watchdog.pending is not None and watchdog.pending.phase == "failed"
+    assert watchdog.clears == 0
+    expected = {
+        "foreign": foreign,
+        "missing": None,
+        "original": original,
+        "originally-absent": None,
+    }
+    current = target.read_bytes() if target.exists() else None
+    assert current == expected.get(drift, candidate)
+    starts = [cmd[-1] for cmd in socket.calls if cmd[:2] == ["systemctl", "start"]]
+    assert starts == (["ssh.socket"] if known else [])
+    assert socket.socket_active is known
+    actions = {"daemon-reload", "start", "stop", "restart", "reload", "enable", "disable"}
+    if not known:
+        assert not any(cmd[1] in actions for cmd in socket.calls)
+    else:
+        monkeypatch.setattr(ssh, "Runner", lambda: Runner(exec_fn=socket))
+        assert ssh.expire_watchdog(pending.id) == 0
+        assert watchdog.pending is None and watchdog.clears == 1
 
 
 def test_watchdog_recreates_privsep_before_each_socket_daemon_gate(

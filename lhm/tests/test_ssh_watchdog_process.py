@@ -37,6 +37,7 @@ def workdir(tmp_path: Path) -> Iterator[Path]:
 def _configure_paths(patch: pytest.MonkeyPatch, directory: Path) -> Path:
     target = directory / ssh.SSHD_DROPIN.name
     patch.setattr(ssh, "SSHD_DROPIN", target)
+    patch.setattr(ssh, "_SSHD_DROPIN_UID", os.geteuid())
     patch.setattr(ssh, "PRIVSEP_DIR", directory / "run" / "sshd")
     patch.setattr(watchdog, "_STATE_DIR", directory / "state")
     patch.setattr(watchdog, "_ROOT_UID", os.geteuid())

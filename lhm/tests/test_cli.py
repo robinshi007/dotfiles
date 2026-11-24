@@ -307,35 +307,58 @@ def test_apply_ssh_hardening_dry_run_prints_banner_and_port(
 
 
 @pytest.mark.parametrize(
+    ("command", "operation", "hint"),
+    [
+        ("ssh-confirm", "confirm_watchdog", "independent, non-multiplexed SSH key login"),
+        ("ssh-recover", "recover_failed_watchdog", "console: your SSH connection may drop"),
+    ],
+)
+@pytest.mark.parametrize(
     ("args", "exit_code", "status"),
     [([], cli.EXIT_FAIL, "FAIL"), (["--dry-run"], cli.EXIT_OK, "PLANNED")],
 )
-def test_ssh_confirm_root_gate_and_dry_run(
+def test_ssh_watchdog_root_gate_and_dry_run(
+    command: str,
+    operation: str,
+    hint: str,
     args: list[str],
     exit_code: int,
     status: str,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(cli, "is_root", lambda: False)
+    is_root = Mock(return_value=False)
     confirm = Mock()
-    disarm = Mock()
+    dispatch = Mock()
+    monkeypatch.setattr(cli, "is_root", is_root)
     monkeypatch.setattr(cli, "confirm_once", confirm)
-    monkeypatch.setattr(cli.ssh_module, "confirm_watchdog", disarm)
-    assert cli.main(["ssh-confirm", "txid", "--json", *args]) == exit_code
-    (step,) = json.loads(capsys.readouterr().out)
+    monkeypatch.setattr(cli.ssh_module, operation, dispatch)
+    assert cli.main([command, "txid", "--json", *args]) == exit_code
+    captured = capsys.readouterr()
+    (step,) = json.loads(captured.out)
+    assert step["name"] == command
     assert step["status"] == status
     if args:
+        is_root.assert_not_called()
         assert "txid" in step["detail"]
-        assert "independent, non-multiplexed SSH key login" in step["detail"]
+        assert hint in step["detail"]
+        assert captured.err == ""
+        if command == "ssh-recover":
+            assert "restore pre-change SSH configuration and listeners" in step["detail"]
     else:
         assert "requires root" in step["detail"]
     confirm.assert_not_called()
-    disarm.assert_not_called()
+    dispatch.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("command", "operation"),
+    [("ssh-confirm", "confirm_watchdog"), ("ssh-recover", "recover_failed_watchdog")],
+)
 @pytest.mark.parametrize(("tty", "answers"), [(False, []), (True, ["n"]), (True, [EOFError()])])
-def test_ssh_confirm_aborts_without_tty_or_confirmation_even_with_bypass(
+def test_ssh_watchdog_aborts_without_tty_or_confirmation_even_with_bypass(
+    command: str,
+    operation: str,
     tty: bool,
     answers: list[str | EOFError],
     monkeypatch: pytest.MonkeyPatch,
@@ -345,18 +368,41 @@ def test_ssh_confirm_aborts_without_tty_or_confirmation_even_with_bypass(
     monkeypatch.setenv(BYPASS_ENV, "1")
     monkeypatch.setattr("sys.stdin.isatty", lambda: tty)
     prompt = Mock(side_effect=answers)
-    disarm = Mock()
+    dispatch = Mock()
     monkeypatch.setattr("builtins.input", prompt)
-    monkeypatch.setattr(cli.ssh_module, "confirm_watchdog", disarm)
+    monkeypatch.setattr(cli.ssh_module, operation, dispatch)
 
-    assert cli.main(["ssh-confirm", "txid", "--json"]) == cli.EXIT_ABORT
+    assert cli.main([command, "txid", "--json"]) == cli.EXIT_ABORT
     captured = capsys.readouterr()
     assert json.loads(captured.out)[0]["status"] == "ABORTED"
     assert BYPASS_ENV not in captured.err
     assert prompt.call_count == len(answers)
-    disarm.assert_not_called()
+    dispatch.assert_not_called()
 
 
+def test_ssh_recover_aborts_if_confirmation_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "is_root", lambda: True)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    prompt = Mock(side_effect=KeyboardInterrupt)
+    dispatch = Mock()
+    monkeypatch.setattr("builtins.input", prompt)
+    monkeypatch.setattr(cli.ssh_module, "recover_failed_watchdog", dispatch)
+
+    assert cli.main(["ssh-recover", "txid", "--json"]) == cli.EXIT_ABORT
+    assert json.loads(capsys.readouterr().out)[0]["status"] == "ABORTED"
+    prompt.assert_called_once()
+    dispatch.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("command", "operation", "hint"),
+    [
+        ("ssh-confirm", "confirm_watchdog", "independent, non-multiplexed SSH key login"),
+        ("ssh-recover", "recover_failed_watchdog", "console: your SSH connection may drop"),
+    ],
+)
 @pytest.mark.parametrize(
     ("outcome", "status", "exit_code"),
     [
@@ -365,7 +411,10 @@ def test_ssh_confirm_aborts_without_tty_or_confirmation_even_with_bypass(
         ("exception", "FAIL", cli.EXIT_FAIL),
     ],
 )
-def test_ssh_confirm_calls_watchdog_after_one_confirmation_and_reports_result(
+def test_ssh_watchdog_dispatches_after_one_confirmation_and_reports_result(
+    command: str,
+    operation: str,
+    hint: str,
     outcome: str,
     status: str,
     exit_code: int,
@@ -375,25 +424,32 @@ def test_ssh_confirm_calls_watchdog_after_one_confirmation_and_reports_result(
     monkeypatch.setattr(cli, "is_root", lambda: True)
     monkeypatch.setenv(BYPASS_ENV, "1")
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
-    prompt = Mock(side_effect=["y", "n"])
+
+    def answer(message: str) -> str:
+        print(message)
+        return "y"
+
+    prompt = Mock(side_effect=answer)
     monkeypatch.setattr("builtins.input", prompt)
     calls: list[str] = []
 
-    def disarm(runner: Runner, txid: str) -> list[StepResult]:
+    def dispatch(runner: Runner, txid: str) -> list[StepResult]:
         prompt.assert_called_once()
         assert not runner.dry_run
         calls.append(txid)
         if outcome == "exception":
             raise cli.ssh_watchdog.WatchdogError("invalid watchdog state")
-        return [StepResult("ssh-confirm", Status(outcome), "result from watchdog")]
+        return [StepResult(command, Status(outcome), "result from watchdog")]
 
-    monkeypatch.setattr(cli.ssh_module, "confirm_watchdog", disarm)
-    assert cli.main(["ssh-confirm", "txid", "--json"]) == exit_code
+    monkeypatch.setattr(cli.ssh_module, operation, dispatch)
+    assert cli.main([command, "txid", "--json"]) == exit_code
     captured = capsys.readouterr()
     (step,) = json.loads(captured.out)
     detail = "invalid watchdog state" if outcome == "exception" else "result from watchdog"
-    assert step == {"name": "ssh-confirm", "status": status, "detail": detail}
-    assert "independent, non-multiplexed SSH key login" in captured.err
+    assert step == {"name": command, "status": status, "detail": detail}
+    assert hint in captured.err
+    assert "Apply this plan?" in captured.err
+    prompt.assert_called_once()
     assert calls == ["txid"]
 
 

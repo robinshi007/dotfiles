@@ -19,6 +19,7 @@ lhm apply updates [--security-only]
 lhm apply ssh-user NAME --key FILE [--sudo]
 lhm apply ssh-hardening [--port 22345] [--allow-user NAME]...
 lhm ssh-confirm ID                           # accept a pending live SSH change
+lhm ssh-recover ID                           # retry recovery of a failed SSH transaction
 lhm apply firewall [--allow PORT/PROTO]...   # 22345/tcp pre-allowed by default
 lhm apply fail2ban [--bantime 8h --findtime 30m --maxretry 3] [--caddy]
 lhm apply cleanup-services                   # interactive per-item selection
@@ -46,8 +47,8 @@ For `apply cleanup-services`, selecting units is input to the plan, not confirma
 `LHM_CONFIRM_BYPASS=1` (env, exact value `1`) skips the single confirmation prompt
 where supported for unattended root runs and the integration suite
 (`lhm/integration/`). It is not a CLI flag and never bypasses the idempotency
-check or the dry-run guarantee. `ssh-confirm` and `apply cleanup-services` do
-not honor it.
+check or the dry-run guarantee. `ssh-confirm`, `ssh-recover`, and
+`apply cleanup-services` do not honor it.
 
 ## Safety rules
 
@@ -101,7 +102,7 @@ not honor it.
    (`/run/sshd`) before validating the restored configuration. Recovery reports
    failure explicitly if the prior listener cannot be confirmed. Do not switch
    away from a socket when its original enablement cannot be read.
-   SSH apply, confirmation, timed recovery and CLI rollback of the managed
+   SSH apply, confirmation, timed and manual recovery, and CLI rollback of the managed
    SSH drop-in serialize against the same SSH mutation lock. Confirmation and
    recovery recheck the current transaction under lock so a stale ID or a race
    at expiry cannot act on a newer or already resolved transaction. While a
@@ -190,10 +191,17 @@ not honor it.
    without a start-rate limit.
    Corrupt recovery state or external drift in the managed configuration
    instead retains the pending marker for manual recovery without overwriting
-   external changes or triggering a restart loop. If recovery fails or cannot
-   be verified, inspect the journal for
-   `lhm-ssh-rollback-<id>.service` and recover from the local console; do not
-   delete `pending.json` to clear a refusal.
+   external changes or triggering a restart loop. The `failed` phase means
+   recovery has not completed and the change cannot be confirmed; it does not
+   diagnose an account or SSH key problem. Foreground apply can set this phase
+   before the timer worker runs, so check the original apply output (including
+   stderr) as well as the current boot's journal for `lhm-ssh-rollback-<id>.service`.
+   `ssh-recover ID` requires root, a TTY, and one exact `y` with no bypass.
+   It retries the original recovery only for the matching failed transaction
+   in the same boot. It does not override trust checks or clear the marker if
+   recovery cannot be verified. Use the local or out-of-band console; see
+   [README](README.md#recover-a-failed-ssh-transaction) for legacy v1 recovery
+   without replacing the installed worker or deleting the marker.
 7. Secrets: the alert script embeds the webhook URL, so it is installed 0700
     root:root and its `.bak` is no more permissive than 0700; unit files never
     contain the URL. Shell
@@ -274,7 +282,7 @@ lhm/tests/*                   # host-management commands use a fake runner
 - `--dry-run` performs zero writes (tested).
 - Non-TTY apply fails closed (tested).
 - `LHM_CONFIRM_BYPASS=1` skips only the single prompt where supported; it
-  never skips the `ssh-confirm` prompt.
+  never skips the `ssh-confirm` or `ssh-recover` prompt.
 - Backup naming/rotation tested; marked-block append idempotency tested.
 - sshd drop-in content validated against `sshd -T` semantics in unit tests.
 - `lhm/integration/run.sh` runs the scenarios against real Ubuntu containers

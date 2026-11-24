@@ -413,6 +413,39 @@ def test_rollback_copy_failure_keeps_target_and_backup(tmp_path: Path) -> None:
     assert _temp_files(tmp_path) == []
 
 
+def test_rollback_checks_opened_source_before_reading_or_staging(tmp_path: Path) -> None:
+    target = tmp_path / "f"
+    target.write_bytes(b"current")
+    source = tmp_path / "f.bak"
+    source.write_bytes(b"previous")
+    source.chmod(0o600)
+    before = source.lstat()
+    real_open = os.open
+
+    def open_after_chmod(path: Path, flags: int) -> int:
+        assert path == source
+        source.chmod(0o620)
+        return real_open(path, flags)
+
+    def check_source(info: os.stat_result) -> None:
+        assert os.path.samestat(info, before)
+        if info.st_mode & stat.S_IWGRP:
+            raise ValueError("unsafe backup mode")
+
+    def unexpected_io(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("unsafe backup was read or staged")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "open", open_after_chmod)
+        mp.setattr(os, "read", unexpected_io)
+        mp.setattr(os, "write", unexpected_io)
+        mp.setattr(backup_module.tempfile, "mkstemp", unexpected_io)
+        with pytest.raises(ValueError, match="unsafe backup mode"):
+            rollback_file(target, backup=source, check_source=check_source)
+    assert target.read_bytes() == b"current" and source.read_bytes() == b"previous"
+    assert _temp_files(tmp_path) == []
+
+
 def test_rollback_preserves_backup_mode(tmp_path: Path) -> None:
     target = tmp_path / "f"
     target.write_text("current", encoding="utf-8")

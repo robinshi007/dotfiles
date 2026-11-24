@@ -115,6 +115,10 @@ class _RecoveryDeferred(SshError):
     """Recovery could not safely complete on this attempt."""
 
 
+class _UntrustedDropin(SshError):
+    """The drop-in or backup cannot safely be used for recovery."""
+
+
 def _retryable_recovery_error(exc: Exception) -> bool:
     if isinstance(exc, ssh_watchdog.WatchdogError) and isinstance(exc.__cause__, OSError):
         exc = exc.__cause__
@@ -489,29 +493,45 @@ def apply_user(runner: Runner, *, user: str, key_file: str, sudo: bool = False) 
 
 def _rollback_dropin(snapshot: bytes | None, candidate: bytes, backup: Path | None) -> StepResult:
     step = "restore ssh drop-in"
-    current = _dropin_snapshot()
+    current = _dropin_snapshot(require_trusted=True)
     if current == snapshot:
         return StepResult(step, Status.SKIPPED, "pre-change drop-in already in place")
     if current != candidate:
         raise SshError("SSH drop-in differs from this run's candidate; left untouched")
     if snapshot is not None:
-        if backup is None or _dropin_snapshot(backup) != snapshot:
-            raise SshError("this run's SSH backup is missing or changed; drop-in left untouched")
-        if _dropin_snapshot() != candidate:
-            raise SshError("SSH drop-in changed during recovery; left untouched")
-        rollback_file(SSHD_DROPIN, backup=backup)
+        missing_or_changed = "this run's SSH backup is missing or changed; drop-in left untouched"
+        if backup is None:
+            raise SshError(missing_or_changed)
+
+        def check_source(source: os.stat_result) -> None:
+            _require_trusted_dropin(backup, source)
+
+        def check_copy(staged: Path) -> None:
+            if _dropin_snapshot(staged, require_trusted=True) != snapshot:
+                raise SshError(missing_or_changed)
+            if _dropin_snapshot(require_trusted=True) != candidate:
+                raise SshError("SSH drop-in changed during recovery; left untouched")
+
+        try:
+            rollback_file(
+                SSHD_DROPIN, backup=backup, check_source=check_source, check_copy=check_copy
+            )
+        except FileNotFoundError as exc:
+            if exc.filename == os.fspath(backup):
+                raise SshError(missing_or_changed) from exc
+            raise
         detail = f"restored {backup.name}"
     else:
         remove_file(SSHD_DROPIN)
         notify_file_change("deleted", SSHD_DROPIN, old=candidate.decode("utf-8"))
         detail = "removed the new drop-in"
-    if _dropin_snapshot() != snapshot:
+    if _dropin_snapshot(require_trusted=True) != snapshot:
         raise SshError("restored SSH drop-in could not be verified")
     return StepResult(step, Status.CHANGED, detail)
 
 
 def _require_original_dropin(snapshot: bytes | None) -> None:
-    if _dropin_snapshot() != snapshot:
+    if _dropin_snapshot(require_trusted=True) != snapshot:
         raise SshError("SSH drop-in changed during recovery; left untouched")
 
 
@@ -732,6 +752,7 @@ def _restore_socket_runtime(
     warnings: list[str],
     *,
     snapshot: bytes | None,
+    candidate: bytes,
     restart_attempted: bool,
     disk_restored: bool,
     fallback_attempted: bool,
@@ -758,6 +779,7 @@ def _restore_socket_runtime(
     current = state()
     reload_failed = False
     if disk_restored and current in (stopped_idle, standalone_idle):
+        _require_original_dropin(snapshot)
         reload_failed = not runner.run(["systemctl", "daemon-reload"], check=False).ok
         if reload_failed:
             warnings.append("daemon-reload failed")
@@ -801,6 +823,10 @@ def _restore_socket_runtime(
         warnings.append("cached socket endpoints do not match the original listeners")
     start_failed = False
     if socket_matches and state() == stopped_idle:
+        if disk_restored:
+            _require_original_dropin(snapshot)
+        elif _dropin_snapshot(require_trusted=True) not in (snapshot, candidate):
+            raise _UntrustedDropin("SSH drop-in changed during recovery; left untouched")
         start_failed = not runner.run(
             ["systemctl", "start", "--job-mode=fail", socket_unit], check=False
         ).ok
@@ -835,6 +861,7 @@ def _recover_socket(
     results: list[StepResult],
     *,
     snapshot: bytes | None,
+    candidate: bytes,
     restart_attempted: bool,
     socket_disable_attempted: bool,
     service_enable_attempted: bool,
@@ -870,11 +897,14 @@ def _recover_socket(
                     expected,
                     warnings,
                     snapshot=snapshot,
+                    candidate=candidate,
                     restart_attempted=restart_attempted,
                     disk_restored=disk_restored,
                     fallback_attempted=fallback_attempted,
                     record_fallback=record_fallback,
                 )
+            except _UntrustedDropin:
+                raise  # Do not change enablement after detecting an untrusted drop-in.
             except (CommandError, OSError, ValueError) as exc:
                 problems.append(exc)
         # Restore links without an implicit daemon-reload or a runtime job.
@@ -1200,8 +1230,15 @@ def _verify_hardening(
     )
 
 
+def _require_trusted_dropin(path: Path, info: os.stat_result) -> None:
+    if info.st_uid != _SSHD_DROPIN_UID or info.st_mode & 0o022:
+        raise _UntrustedDropin(
+            f"refusing SSH drop-in or backup with unsafe owner or permissions: {path}"
+        )
+
+
 def _dropin_snapshot(path: Path | None = None, *, require_trusted: bool = False) -> bytes | None:
-    """Require trusted metadata when using contents to decide what to apply."""
+    """Read a drop-in or backup, optionally requiring trusted metadata on the same FD."""
     path = SSHD_DROPIN if path is None else path
     if path.is_symlink():
         raise SshError(f"refusing SSH drop-in or backup symlink: {path}")
@@ -1213,19 +1250,23 @@ def _dropin_snapshot(path: Path | None = None, *, require_trusted: bool = False)
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise SshError(f"refusing non-regular SSH drop-in or backup: {path}")
-        if require_trusted and (info.st_uid != _SSHD_DROPIN_UID or info.st_mode & 0o022):
-            raise SshError(
-                f"refusing SSH drop-in or backup with unsafe owner or permissions: {path}"
-            )
+        if require_trusted:
+            _require_trusted_dropin(path, info)
         snapshot = handle.read()
         if require_trusted:
+            detail = f"SSH drop-in or backup changed while reading: {path}"
             after = os.fstat(fd)
-            if (after.st_uid, after.st_mode, after.st_ctime_ns) != (
-                info.st_uid,
-                info.st_mode,
-                info.st_ctime_ns,
+            try:
+                named = path.lstat()
+            except FileNotFoundError as exc:
+                raise _UntrustedDropin(detail) from exc
+            expected = (info.st_uid, info.st_mode, info.st_ctime_ns)
+            if (
+                not os.path.samestat(after, named)
+                or (after.st_uid, after.st_mode, after.st_ctime_ns) != expected
+                or (named.st_uid, named.st_mode, named.st_ctime_ns) != expected
             ):
-                raise SshError(f"SSH drop-in or backup changed while reading: {path}")
+                raise _UntrustedDropin(detail)
         return snapshot
 
 
@@ -1435,18 +1476,19 @@ def _recover_watchdog(
     state = _recovery_state(pending.data)
     if pending.phase == "prepared":
         _require_inert_prepared(state)
+    else:
+        pending = ssh_watchdog.update(pending, phase="failed")
+
+    if not state.write_attempted:
+        _dropin_snapshot(require_trusted=True)
         ssh_watchdog.clear(runner, pending)
         return 0
-    pending = ssh_watchdog.update(pending, phase="failed")
 
     def record_fallback() -> None:
         nonlocal pending
         if not pending.data.get("fallback_attempted"):
             pending = ssh_watchdog.update(pending, fallback_attempted=True)
 
-    if not state.write_attempted:
-        ssh_watchdog.clear(runner, pending)
-        return 0
     disk_status = 0
     try:
         results.append(_rollback_dropin(state.snapshot, state.candidate, state.backup))
@@ -1469,6 +1511,7 @@ def _recover_watchdog(
             state.endpoints,
             results,
             snapshot=state.snapshot,
+            candidate=state.candidate,
             restart_attempted=state.action == "restart",
             socket_disable_attempted=state.action in {"disable", "enable", "restart"}
             and conversion.socket_enabled,
@@ -1521,6 +1564,64 @@ def expire_watchdog(txid: str) -> int:
     return status
 
 
+def _watchdog_recovery_instructions(txid: str) -> str:
+    return (
+        f"from the local console, check `journalctl -u lhm-ssh-rollback-{txid}.service` "
+        "(if no worker journal is available, check the original apply output/stderr) "
+        f"and resolve any blockers before running `lhm ssh-recover {txid}` as root"
+    )
+
+
+def _failed_watchdog_detail(txid: str) -> str:
+    return (
+        f"SSH watchdog transaction {txid} failed; recovery is required: "
+        f"{_watchdog_recovery_instructions(txid)}"
+    )
+
+
+def recover_failed_watchdog(runner: Runner, txid: str) -> list[StepResult]:
+    """Attempt recovery once for a matching failed transaction under the shared lock."""
+    step = "recover SSH watchdog"
+    if not re.fullmatch(r"[0-9a-f]{32}", txid):
+        return [StepResult(step, Status.FAIL, "invalid SSH watchdog transaction ID")]
+    if runner.dry_run or not mutations_allowed():
+        return [StepResult(step, Status.FAIL, "SSH watchdog recovery is not allowed in dry-run")]
+    if geteuid() != 0:
+        return [StepResult(step, Status.FAIL, "ssh-recover requires root")]
+
+    results: list[StepResult] = []
+    try:
+        with locked_target(SSHD_DROPIN):
+            pending = ssh_watchdog.current()
+            if pending is None or pending.id != txid or pending.phase != "failed":
+                detail = "no matching failed SSH watchdog transaction"
+                return [StepResult(step, Status.FAIL, detail)]
+            status = _recover_watchdog(runner, pending, results)
+    except BlockingIOError:
+        detail = "SSH watchdog recovery is busy (managed target is locked)"
+    except (
+        SshError,
+        ssh_watchdog.WatchdogError,
+        CommandError,
+        OSError,
+        userkeys.UserKeysError,
+    ) as exc:
+        detail = str(exc)
+    except ValueError:
+        # A parser exception can include untrusted manifest values.
+        detail = "invalid SSH watchdog recovery state"
+    else:
+        if status == 0:
+            results.append(StepResult(step, Status.CHANGED, f"recovered {txid}"))
+            return results
+        detail = (
+            "SSH watchdog recovery deferred" if status == _RETRY else "SSH watchdog recovery failed"
+        )
+    detail = f"{detail}; {_watchdog_recovery_instructions(txid)}"
+    results.append(StepResult(step, Status.FAIL, detail))
+    return results
+
+
 def _require_watchdog_time(pending: ssh_watchdog.Pending) -> None:
     if monotonic() >= pending.deadline:
         raise SshError("SSH watchdog deadline reached; rollback is required")
@@ -1558,6 +1659,8 @@ def confirm_watchdog(runner: Runner, txid: str) -> list[StepResult]:
     try:
         with locked_target(SSHD_DROPIN):
             pending = ssh_watchdog.current()
+            if pending is not None and pending.id == txid and pending.phase == "failed":
+                raise SshError(_failed_watchdog_detail(txid))
             if pending is None or pending.id != txid or pending.phase != "awaiting-confirm":
                 raise SshError("no matching SSH watchdog transaction awaiting confirmation")
             _require_watchdog_time(pending)
@@ -1612,6 +1715,8 @@ def _require_no_watchdog(runner: Runner, *, clear_prepared: bool = False) -> Non
     pending = ssh_watchdog.current()
     if pending is None:
         return
+    if pending.phase == "failed":
+        raise SshError(_failed_watchdog_detail(pending.id))
     if pending.phase == "prepared":
         # The lock excludes a live arming operation. A crashed arm may never
         # have scheduled a timer, and cannot have made any SSH changes yet.

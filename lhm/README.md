@@ -13,7 +13,7 @@ Safety-first design:
   and no active bypass, confirmation fails closed and exits **3** (`ABORTED`),
   never 0. `LHM_CONFIRM_BYPASS=1`
   (exactly `1`, no padding) skips only the prompt on operations that support
-  the bypass for unattended root runs / CI. `ssh-confirm` and
+  the bypass for unattended root runs / CI. `ssh-confirm`, `ssh-recover`, and
   `apply cleanup-services` do not honor it.
 - **Backups before edits** — any modified file is backed up first (`name.ext.bak`,
   then `.bak.1`, `.bak.2`...; existing backups are never overwritten).
@@ -40,10 +40,11 @@ uv sync                 # or: uv tool install .  (requires uv, Python 3.15 manag
 uv run lhm --help
 ```
 
-Root is required for live `apply`, `ssh-confirm`, and `rollback`; `query`/`check` work
-unprivileged. For root commands below, `/opt/lhm/bin/lhm` is an example absolute
-path to a trusted, root-controlled CLI installed from a release wheel. A regular
-`uv sync` or CLI install alone does not provision the SSH watchdog.
+Root is required for live `apply`, `ssh-confirm`, `ssh-recover`, and `rollback`;
+`query`/`check` work unprivileged. For root commands below, `/opt/lhm/bin/lhm` is
+an example absolute path to a trusted, root-controlled CLI installed from a
+release wheel. A regular `uv sync` or CLI install alone does not provision the
+SSH watchdog.
 
 ### Provision the SSH watchdog
 
@@ -86,7 +87,8 @@ before arming.
 
 Before redeploying either component, prevent new SSH transactions and verify
 as root that `/run/lhm-ssh-rollback/pending.json` is absent. If it exists or
-cannot be inspected, stop; never overwrite or delete the journal to proceed.
+cannot be inspected, stop; never overwrite or delete the marker to proceed.
+For a failed transaction, see [Recover a failed SSH transaction](#recover-a-failed-ssh-transaction).
 Preserve the previous runtime separately in a root-controlled location before
 provisioning the matching replacement.
 
@@ -101,6 +103,7 @@ lhm apply updates [--security-only]
 lhm apply ssh-user NAME --key FILE [--sudo]
 lhm apply ssh-hardening [--port 22345] [--allow-user NAME]...
 lhm ssh-confirm ID              # from a new SSH key login on the target port
+lhm ssh-recover ID              # retry a failed SSH recovery; console recommended
 lhm apply firewall [--allow PORT/PROTO]...
 lhm apply fail2ban [--bantime 8h --findtime 30m --maxretry 3] [--caddy]
 lhm apply cleanup-services      # interactive: pick services/ports to disable
@@ -266,8 +269,18 @@ such as corrupt state or external edits to the managed configuration require
 manual recovery; the watchdog does not overwrite those edits or clear the
 journal on failure.
 
-If recovery fails, use the local console and replace `ID` below with the printed
-transaction ID to inspect the unit and logs:
+### Recover a failed SSH transaction
+
+If LHM reports a failed transaction (for example, `pending (failed)`), recovery
+has not completed and `ssh-confirm` cannot accept the change. This does not
+diagnose an account or SSH key problem. Foreground apply can leave the
+transaction in `failed` before the timer worker runs, so the service journal
+may be empty. Check the original apply output, including stderr, as well as
+the service journal.
+
+Stay in the same boot and use a local or out-of-band console: recovery can drop
+your SSH connection. Replace `ID` in the examples with the printed transaction
+ID and inspect the per-transaction units and journal:
 
 ```sh
 id=ID
@@ -276,7 +289,30 @@ sudo journalctl -b -u "lhm-ssh-rollback-$id.service"
 ```
 
 An expired transient unit may no longer appear in `systemctl`; check the
-journal. Do not delete `pending.json` just to clear a refusal.
+journal. You may need to fix the underlying problem before retrying. Stay in the
+current boot and leave `pending.json` untouched.
+
+Using the absolute path to your trusted CLI, run:
+
+```sh
+sudo /opt/lhm/bin/lhm ssh-recover ID
+```
+
+This same-boot command requires root and a TTY, with one exact `y` and no
+bypass. It only retries the original recovery for the matching failed
+transaction; it cannot accept the failed configuration. If recovery cannot be
+verified, the pending marker is retained. If LHM refuses an unsafe drop-in or
+backup, investigate from the console; do not change ownership or permissions
+just to bypass the refusal.
+
+If the installed CLI lacks `ssh-recover`, independently deploy a trusted,
+root-controlled CLI from this release at a separate path and use that path
+for the command. It can retry recovery from a compatible v1 marker in the same
+boot, even if the marker lacks the SSH session freshness field used for
+confirmation. Do not replace the installed CLI or worker, and do not edit or
+delete the marker. Once recovery has cleared the marker, deploy the
+matching upgraded CLI and worker before the next SSH apply, following the
+[safe replacement instructions](#provision-the-ssh-watchdog).
 
 While pending, a new SSH hardening apply and manual `lhm rollback` of the
 managed SSH drop-in are refused. Old IDs cannot confirm newer changes, and
@@ -291,7 +327,7 @@ can be confirmed. Otherwise, use the printed console guidance.
 
 | module | automatic | manual (printed on FAIL) |
 | ------ | --------- | ------------------------ |
-| ssh | attempt to restore this run's prior drop-in and listener on failure or if the timer expires unconfirmed | if recovery fails or cannot be verified, check the systemd journal and recover from the local console; do not delete transaction state to clear a refusal |
+| ssh | attempt to restore this run's prior drop-in and listener on failure or if the timer expires unconfirmed | check the systemd journal and [retry recovery](#recover-a-failed-ssh-transaction) from the console; do not delete transaction state to clear a refusal |
 | firewall | none | inspect `ufw status verbose` and recover the intended rules from the local console; lhm never disables UFW automatically |
 | audit | none | inspect `auditctl -s`; if needed, restore the managed rules file from its backup. Immutable live rules require a reboot to change |
 | sandbox | drop-in rollback if `systemctl restart` fails | start the service and inspect `systemctl status` manually |
