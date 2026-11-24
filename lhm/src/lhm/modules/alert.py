@@ -4,8 +4,14 @@ import socket
 from pathlib import Path
 
 from lhm.core.checks import probe_service
-from lhm.core.confirm import confirm_twice
-from lhm.core.files import render_shell_template, render_template, restrict, write_dropin
+from lhm.core.confirm import confirm_once
+from lhm.core.files import (
+    ensure_dir,
+    render_shell_template,
+    render_template,
+    restrict,
+    write_dropin,
+)
 from lhm.core.report import Status, StepResult
 from lhm.core.runner import CommandError, Runner
 
@@ -145,13 +151,13 @@ def apply_alert(runner: Runner, *, webhook: str = "") -> list[StepResult]:
                 _verify(runner),
             ]
 
-    if not confirm_twice(plan):
+    if not confirm_once(plan):
         return [StepResult("alert", Status.ABORTED, "aborted; no changes made")]
 
     results: list[StepResult] = []
     try:
         if script_needed:
-            SCRIPT.parent.mkdir(parents=True, exist_ok=True)
+            ensure_dir(SCRIPT.parent)
             # 0700 (and root:root): the script embeds the webhook URL, and its
             # .bak copy gets the same mode. ``secret`` keeps --verbose from
             # echoing the URL (content and diff are suppressed).

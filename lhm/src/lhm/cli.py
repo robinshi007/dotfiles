@@ -7,17 +7,20 @@ import os
 import platform
 import socket
 import sys
+from contextlib import nullcontext, redirect_stdout
 from pathlib import Path
 from typing import Any, Callable
 
 from lhm.core import checks, colors
 from lhm.core.backup import backup_file, newest_backup, rollback_file
 from lhm.core.colors import Color
-from lhm.core.confirm import confirm_twice, is_root
+from lhm.core.confirm import confirm_once, is_root
 from lhm.core.distro import DistroError
-from lhm.core.report import RowColor, Status, print_json, print_steps, print_table
+from lhm.core.files import locked_target
+from lhm.core.mutations import mutation_mode, mutations_allowed
+from lhm.core.report import RowColor, Status, StepResult, print_json, print_steps, print_table
 from lhm.core.runner import CommandError, Runner
-from lhm.modules import APPLY_ALL_ORDER, MODULES, resolve
+from lhm.modules import APPLY_ALL_ORDER, MODULES, resolve, ssh_watchdog
 from lhm.modules import alert as alert_module
 from lhm.modules import audit as audit_module
 from lhm.modules import backup as backup_module
@@ -37,6 +40,8 @@ EXIT_USAGE = 2
 # confirmation. Distinct from 0 (automation must not read "hardened") and from
 # 1 (nothing failed; there is nothing to roll back).
 EXIT_ABORT = 3
+
+_SSH_CONFIRM_HINT = "Run only after an independent, non-multiplexed SSH key login."
 
 QueryTable = tuple[list[str], list[list[str]], dict[str, Any], list[RowColor]]
 
@@ -90,9 +95,19 @@ def build_parser() -> argparse.ArgumentParser:
     check_parser = commands.add_parser("check", help="idempotency audit: OK / needs-change")
     _add_global_flags(check_parser, suppress=True)
 
-    rollback = commands.add_parser("rollback", help="restore the newest backup of FILE")
+    rollback = commands.add_parser(
+        "rollback", help="restore a backup of an lhm-managed system file"
+    )
     rollback.add_argument("file")
     _add_global_flags(rollback, suppress=True)
+
+    ssh_confirm = commands.add_parser(
+        "ssh-confirm",
+        help="confirm an SSH watchdog transaction (root only)",
+        description=_SSH_CONFIRM_HINT,
+    )
+    ssh_confirm.add_argument("txid", metavar="ID", help="SSH watchdog transaction ID")
+    _add_global_flags(ssh_confirm, suppress=True)
 
     apply_parser = commands.add_parser("apply", help="apply one module or all of them")
     apply_targets = apply_parser.add_subparsers(dest="module", required=True)
@@ -756,8 +771,40 @@ def _handle_check(args: argparse.Namespace, runner: Runner, as_json: bool) -> in
     return EXIT_OK
 
 
+def _managed_rollback_path(value: str) -> Path:
+    path = Path(value)
+    managed = {
+        alert_module.SCRIPT,
+        alert_module.SERVICE_UNIT,
+        alert_module.TIMER_UNIT,
+        audit_module.RULES_DROPIN,
+        backup_module.SCRIPT,
+        backup_module.SERVICE_UNIT,
+        backup_module.TIMER_UNIT,
+        fail2ban_module.JAIL_DROPIN,
+        fail2ban_module.CADDY_FILTER,
+        logging_module.JOURNALD_DROPIN,
+        logging_module.LOGROTATE_CONF,
+        ssh_module.SSHD_DROPIN,
+        sysctl_module.SYSCTL_DROPIN,
+        updates_module.APT_CONF,
+        *(sandbox_module.dropin_path(name) for name in sandbox_module.WHITELIST),
+    }
+    if path not in managed or value != str(path):
+        raise ValueError("rollback accepts only exact lhm-managed system paths")
+    if path.resolve(strict=False) != path or any(
+        part.is_symlink() for part in (path, *path.parents)
+    ):
+        raise ValueError(f"refusing a symlink in rollback path: {path}")
+    return path
+
+
 def _handle_rollback(args: argparse.Namespace, runner: Runner) -> int:
-    path = Path(args.file)
+    try:
+        path = _managed_rollback_path(args.file)
+    except (ValueError, OSError, RuntimeError) as exc:
+        print(f"lhm: rollback usage error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
     if runner.dry_run:
         print(f"would restore newest backup of {path}")
         return EXIT_OK
@@ -777,13 +824,33 @@ def _handle_rollback(args: argparse.Namespace, runner: Runner) -> int:
         f"  - back up the current {path} first (so this rollback can itself be undone)",
         "  - risk: unsaved/target state is overwritten",
     ]
-    # Restoring a file is not idempotent: same TTY + double-y gate as any apply.
-    if not confirm_twice(plan):
-        return EXIT_FAIL
+    # Restoring a file is not idempotent: require confirmation as for apply.
+    if not confirm_once(plan):
+        return EXIT_ABORT
     try:
-        if path.exists() or path.is_symlink():
-            backup_file(path)
-        used = rollback_file(path, backup=backup)
+        _managed_rollback_path(args.file)
+        with locked_target(path):
+            if path == ssh_module.SSHD_DROPIN:
+                try:
+                    pending = ssh_watchdog.current()
+                except (ssh_watchdog.WatchdogError, OSError) as exc:
+                    print(
+                        f"lhm: rollback failed: unreadable SSH watchdog state: {exc}",
+                        file=sys.stderr,
+                    )
+                    return EXIT_FAIL
+                if pending is not None:
+                    print(
+                        "lhm: rollback refused: an SSH watchdog transaction exists",
+                        file=sys.stderr,
+                    )
+                    return EXIT_FAIL
+            if newest_backup(path) != backup:
+                print("lhm: rollback backup changed; re-run to review it", file=sys.stderr)
+                return EXIT_FAIL
+            if path.exists() or path.is_symlink():
+                backup_file(path)
+            used = rollback_file(path, backup=backup)
     except ValueError as exc:
         print(f"lhm: rollback usage error: {exc}", file=sys.stderr)
         return EXIT_USAGE
@@ -792,6 +859,30 @@ def _handle_rollback(args: argparse.Namespace, runner: Runner) -> int:
         return EXIT_FAIL
     print(f"restored {path} from {used} (previous content backed up)")
     return EXIT_OK
+
+
+def _handle_ssh_confirm(args: argparse.Namespace, runner: Runner, as_json: bool) -> int:
+    name = "ssh-confirm"
+    action = f"disarm SSH watchdog transaction {args.txid!r}"
+    if runner.dry_run:
+        results = [StepResult(name, Status.PLANNED, f"Would {action}. {_SSH_CONFIRM_HINT}")]
+    elif not is_root():
+        results = [StepResult(name, Status.FAIL, "ssh-confirm requires root")]
+    else:
+        plan = [f"Plan (ssh-confirm): {action}", f"  - {_SSH_CONFIRM_HINT}"]
+        with redirect_stdout(sys.stderr) if as_json else nullcontext():
+            confirmed = confirm_once(plan, allow_bypass=False)
+        if not confirmed:
+            results = [StepResult(name, Status.ABORTED, "confirmation not granted")]
+        else:
+            try:
+                results = ssh_module.confirm_watchdog(runner, args.txid)
+            except (ssh_watchdog.WatchdogError, ssh_module.SshError, CommandError, OSError) as exc:
+                results = [StepResult(name, Status.FAIL, str(exc))]
+    print_steps(results, as_json=as_json)
+    if any(result.status is Status.ABORTED for result in results):
+        return EXIT_ABORT
+    return EXIT_FAIL if any(result.status is Status.FAIL for result in results) else EXIT_OK
 
 
 def _run_module(name: str, runner: Runner, as_json: bool, **options: Any) -> int:
@@ -943,15 +1034,18 @@ def main(argv: list[str] | None = None) -> int:
     colors.configure(
         getattr(args, "color", "auto"), verbose=bool(args.verbose), quiet=as_json
     )
-    runner = Runner(dry_run=bool(args.dry_run), verbose=bool(args.verbose))
     try:
-        if args.command == "query":
-            return _handle_query(args, runner, as_json)
-        if args.command == "check":
-            return _handle_check(args, runner, as_json)
-        if args.command == "rollback":
-            return _handle_rollback(args, runner)
-        return _handle_apply(args, runner, as_json)
+        with mutation_mode(dry_run=bool(args.dry_run)):
+            runner = Runner(dry_run=not mutations_allowed(), verbose=bool(args.verbose))
+            if args.command == "query":
+                return _handle_query(args, runner, as_json)
+            if args.command == "check":
+                return _handle_check(args, runner, as_json)
+            if args.command == "rollback":
+                return _handle_rollback(args, runner)
+            if args.command == "ssh-confirm":
+                return _handle_ssh_confirm(args, runner, as_json)
+            return _handle_apply(args, runner, as_json)
     except NotImplementedError as exc:
         print(f"lhm: module '{exc}' not yet implemented", file=sys.stderr)
         return EXIT_USAGE

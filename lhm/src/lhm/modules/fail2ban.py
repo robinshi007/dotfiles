@@ -9,7 +9,7 @@ import re
 import socket
 from pathlib import Path
 
-from lhm.core.confirm import confirm_twice
+from lhm.core.confirm import confirm_once
 from lhm.core.distro import AptBackend, DistroError
 from lhm.core.files import render_template, write_dropin
 from lhm.core.report import Status, StepResult
@@ -35,6 +35,7 @@ SSHD_FINDTIME = "30m"
 SSHD_MAXRETRY = "3"
 CADDY_MAXRETRY = "5"
 TIME_RE = re.compile(r"\d+[smhdw]?")
+RETRY_RE = re.compile(r"\d+")
 
 
 class JailError(ValueError):
@@ -44,7 +45,26 @@ class JailError(ValueError):
 def _time_value(name: str, value: str) -> str:
     if not TIME_RE.fullmatch(value):
         raise JailError(f"invalid {name} {value!r}: use e.g. 1h, 10m, 3600")
+    if _seconds(value) == 0:
+        raise JailError(
+            f"invalid {name} {value!r}: must be strictly positive "
+            "(a zero duration disables the jail, e.g. use 1h, 10m, 3600)"
+        )
     return value
+
+
+def _retry_value(name: str, value: str) -> str:
+    if not RETRY_RE.fullmatch(value):
+        raise JailError(
+            f"invalid {name} {value!r}: use a positive integer without a unit "
+            "suffix (e.g. 3)"
+        )
+    if int(value) == 0:
+        raise JailError(
+            f"invalid {name} {value!r}: must be strictly positive "
+            "(0 would disable banning, e.g. use 3)"
+        )
+    return str(int(value))
 
 
 def _seconds(value: str) -> int | None:
@@ -79,9 +99,9 @@ def desired_conf(
         TEMPLATE,
         bantime=_time_value("bantime", bantime),
         findtime=_time_value("findtime", findtime),
-        maxretry=str(int(_time_value("maxretry", maxretry))),
+        maxretry=_retry_value("maxretry", maxretry),
         caddy_enabled="true" if caddy else "false",
-        caddy_maxretry=str(int(_time_value("caddy_maxretry", caddy_maxretry))),
+        caddy_maxretry=_retry_value("caddy_maxretry", caddy_maxretry),
         ssh_port=str(SSH_PORT),
         hostname=hostname or socket.gethostname(),
     )
@@ -360,7 +380,7 @@ def apply_fail2ban(
         results.extend(_verify(runner, caddy=caddy, bantime=bantime))
         return results
 
-    if not confirm_twice(plan):
+    if not confirm_once(plan):
         return [StepResult("fail2ban", Status.ABORTED, "aborted; no changes made")]
 
     results = []

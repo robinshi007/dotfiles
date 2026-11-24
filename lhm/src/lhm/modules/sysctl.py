@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from lhm.core import checks
-from lhm.core.confirm import confirm_twice
+from lhm.core.confirm import confirm_once
 from lhm.core.files import render_template, write_dropin
 from lhm.core.report import Status, StepResult
 from lhm.core.runner import CommandError, Runner
@@ -118,7 +118,7 @@ def apply_sysctl(runner: Runner) -> list[StepResult]:
             _verify(runner),
         ]
 
-    if not confirm_twice(plan):
+    if not confirm_once(plan):
         return [StepResult("sysctl", Status.ABORTED, "aborted; no changes made")]
 
     results: list[StepResult] = []

@@ -45,11 +45,12 @@ expect_lhm_ok "second rollback $target"
 assert_contains "$(cat "$target")" "# ===== lhm sysctl hardening =====" \
     "second rollback restores the hardened version"
 
-# A file with no backup must fail closed rather than delete anything.
+# An unmanaged file must be refused even when a matching backup exists.
 printf 'no backup here\n' > /tmp/lhm-rollback-orphan
+printf 'should not be restored\n' > /tmp/lhm-rollback-orphan.bak
 run_lhm rollback /tmp/lhm-rollback-orphan
-assert_eq "$LHM_RC" 1 "rollback without a backup exits non-zero"
-assert_contains "$LHM_OUT" "no backup found" "rollback without a backup explains why"
+assert_eq "$LHM_RC" 2 "rollback of unmanaged file exits non-zero"
+assert_contains "$LHM_OUT" "lhm-managed" "rollback of unmanaged file explains why"
 assert_eq "$(cat /tmp/lhm-rollback-orphan)" "no backup here" "orphan file untouched"
 
 finish

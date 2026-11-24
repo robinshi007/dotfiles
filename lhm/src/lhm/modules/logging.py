@@ -2,8 +2,8 @@
 
 from pathlib import Path
 
-from lhm.core.confirm import confirm_twice
-from lhm.core.files import render_template, write_dropin
+from lhm.core.confirm import confirm_once
+from lhm.core.files import ensure_dir, render_template, write_dropin
 from lhm.core.report import Status, StepResult
 from lhm.core.runner import CommandError, Runner
 
@@ -73,13 +73,13 @@ def apply_logging(runner: Runner) -> list[StepResult]:
             _verify(),
         ]
 
-    if not confirm_twice(plan):
+    if not confirm_once(plan):
         return [StepResult("logging", Status.ABORTED, "aborted; no changes made")]
 
     results: list[StepResult] = []
     try:
         if journald_needed:
-            JOURNALD_DROPIN.parent.mkdir(parents=True, exist_ok=True)
+            ensure_dir(JOURNALD_DROPIN.parent)
             outcome = write_dropin(JOURNALD_DROPIN, desired_journald())
             results.append(
                 StepResult(

@@ -42,7 +42,7 @@ def test_dry_run_records_commands_and_writes_nothing(
 def test_apply_writes_tolerates_missing_userns_key_and_verifies(
     fake_exec: Any, dropin: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sysctl, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(sysctl, "confirm_once", lambda plan: True)
     fake_exec.responses.append(
         (
             "sysctl --system",
@@ -67,7 +67,7 @@ def test_identical_file_refreshes_then_verifies(
 ) -> None:
     dropin.parent.mkdir(parents=True)
     dropin.write_text(sysctl.desired_conf(), encoding="utf-8")
-    monkeypatch.setattr(sysctl, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(sysctl, "confirm_once", lambda plan: True)
     # Existing values drift from the wanted ones.
     _spot_responses(fake_exec, {"kernel.kptr_restrict": "0\n"})
     fake_exec.responses.append(("sysctl --system", 0, "", ""))
@@ -82,7 +82,7 @@ def test_identical_file_refreshes_then_verifies(
 def test_verify_fails_on_wrong_spot_check_value(
     fake_exec: Any, dropin: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sysctl, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(sysctl, "confirm_once", lambda plan: True)
     fake_exec.responses.append(("sysctl --system", 0, "", ""))
     _spot_responses(fake_exec, {"net.ipv4.conf.all.rp_filter": "0\n"})
     results = sysctl.apply_sysctl(Runner(exec_fn=fake_exec))

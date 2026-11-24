@@ -42,7 +42,7 @@ def test_whitelist_map_is_complete() -> None:
 
 
 def test_dropin_content(fake_exec: Any, unit_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sandbox, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(sandbox, "confirm_once", lambda plan: True)
     fake_exec.responses.append(
         ("systemctl show -p LoadState --value ssh.service", 0, "loaded\n", "")
     )
@@ -76,7 +76,7 @@ def test_missing_unit_is_skipped_with_warning(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(sandbox, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(sandbox, "confirm_once", lambda plan: True)
     fake_exec.responses.append(
         ("systemctl show -p LoadState --value nginx.service", 0, "not-found\n", "")
     )
@@ -112,7 +112,7 @@ class RestartFailingExec:
 def test_restart_failure_auto_rolls_back_dropin(
     unit_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sandbox, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(sandbox, "confirm_once", lambda plan: True)
     exec_fn = RestartFailingExec()
     results = sandbox.apply_sandbox(Runner(exec_fn=exec_fn), services=["ssh"])
     restart = next(r for r in results if r.name == "restart ssh.service")
@@ -128,7 +128,7 @@ def test_restart_failure_auto_rolls_back_dropin(
 def test_restart_failure_restores_existing_dropin(
     unit_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sandbox, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(sandbox, "confirm_once", lambda plan: True)
     path = unit_dir / "ssh.service.d" / "99-lhm-sandbox.conf"
     path.parent.mkdir(parents=True)
     path.write_text("# old sandbox\n", encoding="utf-8")
@@ -151,7 +151,7 @@ def test_rollback_delete_prints_red_minus(unit_dir: Path) -> None:
     colors.configure("always")
     colors.set_output(stream)
     try:
-        assert sandbox._rollback_dropin("ssh") == "removed the new drop-in"
+        assert sandbox._rollback_dropin("ssh", None) == "removed the new drop-in"
     finally:
         colors.set_output(None)
     assert stream.getvalue() == f"\033[31m- {path}\033[0m\n"

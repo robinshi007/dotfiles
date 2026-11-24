@@ -27,7 +27,7 @@ def test_dry_run_plans_without_commands(fake_exec: Any, conf_path: Path) -> None
 def test_apply_writes_conf_and_verifies(
     fake_exec: Any, conf_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(updates, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(updates, "confirm_once", lambda plan: True)
     fake_exec.responses.extend(
         [
             ("dpkg-query -W -f=${Status} unattended-upgrades", 1, "", "not installed"),
@@ -52,7 +52,7 @@ def test_apply_writes_conf_and_verifies(
 def test_security_only_uses_unattended_upgrade(
     fake_exec: Any, conf_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(updates, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(updates, "confirm_once", lambda plan: True)
     fake_exec.responses.extend(
         [
             ("dpkg-query", 0, "install ok installed", ""),
@@ -70,7 +70,7 @@ def test_second_run_is_idempotent(
     fake_exec: Any, conf_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     conf_path.write_text(updates.desired_conf(), encoding="utf-8")
-    monkeypatch.setattr(updates, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(updates, "confirm_once", lambda plan: True)
     fake_exec.responses.extend(
         [
             ("dpkg-query", 0, "install ok installed", ""),
@@ -88,7 +88,7 @@ def test_second_run_is_idempotent(
 def test_refusal_makes_no_changes(
     fake_exec: Any, conf_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(updates, "confirm_twice", lambda plan: False)
+    monkeypatch.setattr(updates, "confirm_once", lambda plan: False)
     fake_exec.responses.append(("dpkg-query", 1, "", ""))
     results = updates.UpdatesModule().apply(Runner(exec_fn=fake_exec))
     assert results[0].status is Status.ABORTED
@@ -100,7 +100,7 @@ def test_refusal_makes_no_changes(
 def test_verify_fails_when_service_inactive(
     fake_exec: Any, conf_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(updates, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(updates, "confirm_once", lambda plan: True)
     fake_exec.responses.extend(
         [
             ("dpkg-query", 0, "install ok installed", ""),

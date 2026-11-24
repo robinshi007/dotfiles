@@ -16,6 +16,11 @@ To                         Action      From
 22345/tcp                  ALLOW IN    Anywhere
 """
 
+ABSENT_SOCKETS = (
+    ("systemctl is-active ssh.socket", 4, "inactive\n", ""),
+    ("systemctl is-active sshd.socket", 4, "inactive\n", ""),
+)
+
 
 def test_parse_allow() -> None:
     assert firewall.parse_allow("80/tcp") == "80/tcp"
@@ -62,6 +67,10 @@ class UfwSequenceExec:
 
     def __call__(self, cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
         self.calls.append(list(cmd))
+        if cmd[:2] == ["systemctl", "is-active"]:
+            return subprocess.CompletedProcess(cmd, 4, "inactive\n", "")
+        if cmd == ["sshd", "-T"]:
+            return subprocess.CompletedProcess(cmd, 0, "port 22345\n", "")
         if cmd[:3] == ["ufw", "status", "verbose"]:
             self.status_calls += 1
             body = "Status: inactive\n" if self.status_calls == 1 else self.final
@@ -73,7 +82,7 @@ UFW_ENABLED_WITH_80 = UFW_ENABLED_CLEAN + "80/tcp                     ALLOW IN  
 
 
 def test_apply_order_and_skip_existing_ssh_rule(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(firewall, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(firewall, "confirm_once", lambda plan: True)
     exec_fn = UfwSequenceExec(UFW_ENABLED_WITH_80)
     results = firewall.apply_firewall(Runner(exec_fn=exec_fn), allow=["80/tcp"])
     mutating = [call for call in exec_fn.calls if call[:2] == ["ufw", "allow"]]
@@ -94,6 +103,7 @@ def test_already_configured_is_a_noop(fake_exec: Any) -> None:
                 'LISTEN 0 128 0.0.0.0:22345 0.0.0.0:* users:(("sshd",pid=1,fd=3))\n',
                 "",
             ),
+            *ABSENT_SOCKETS,
             ("ufw status verbose", 0, UFW_ENABLED_CLEAN, ""),
         ]
     )
@@ -106,9 +116,11 @@ def test_already_configured_is_a_noop(fake_exec: Any) -> None:
 def test_existing_rules_are_not_reapplied(
     fake_exec: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(firewall, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(firewall, "confirm_once", lambda plan: True)
     fake_exec.responses.extend(
         [
+            *ABSENT_SOCKETS,
+            ("sshd -T", 0, "port 22345\n", ""),
             (
                 "ufw status verbose",
                 0,
@@ -129,7 +141,7 @@ def test_existing_rules_are_not_reapplied(
 
 
 def test_verify_fails_when_ufw_inactive(fake_exec: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(firewall, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(firewall, "confirm_once", lambda plan: True)
     fake_exec.responses.extend(
         [
             (
@@ -138,6 +150,7 @@ def test_verify_fails_when_ufw_inactive(fake_exec: Any, monkeypatch: pytest.Monk
                 'LISTEN 0 128 0.0.0.0:22345 0.0.0.0:* users:(("sshd",pid=1,fd=3))\n',
                 "",
             ),
+            *ABSENT_SOCKETS,
             ("ufw status verbose", 0, "Status: inactive\n", ""),
             ("ufw allow", 0, "", ""),
             ("ufw --force enable", 0, "", ""),
@@ -155,6 +168,10 @@ class TimeoutAwareExec:
 
     def __call__(self, cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
         self.timeouts.append(timeout)
+        if cmd[:2] == ["systemctl", "is-active"]:
+            return subprocess.CompletedProcess(cmd, 4, "inactive\n", "")
+        if cmd == ["sshd", "-T"]:
+            return subprocess.CompletedProcess(cmd, 0, "port 22345\n", "")
         if cmd[:3] == ["ufw", "status", "verbose"]:
             return subprocess.CompletedProcess(cmd, 0, UFW_ENABLED_CLEAN, "")
         return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -173,7 +190,7 @@ LISTEN 0      128             [::]:22            [::]:*     users:(("sshd",pid=9
 
 
 class CurrentPortExec:
-    """sshd still on port 22 (apply all with only ssh-user done)."""
+    """Firewall state sequence with configurable SSH probe output."""
 
     def __init__(self, ss_out: str = "", sshd_t_out: str = "") -> None:
         self.calls: list[list[str]] = []
@@ -183,6 +200,8 @@ class CurrentPortExec:
 
     def __call__(self, cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
         self.calls.append(list(cmd))
+        if cmd[:2] == ["systemctl", "is-active"]:
+            return subprocess.CompletedProcess(cmd, 4, "inactive\n", "")
         if cmd[:3] == ["ufw", "status", "verbose"]:
             self.status_calls += 1
             if self.status_calls == 1:
@@ -205,7 +224,7 @@ class CurrentPortExec:
 
 def test_current_ssh_port_is_allowed_before_deny(monkeypatch: pytest.MonkeyPatch) -> None:
     """A server still on port 22 must keep 22/tcp open before default deny."""
-    monkeypatch.setattr(firewall, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(firewall, "confirm_once", lambda plan: True)
     exec_fn = CurrentPortExec(SS_TLN_PORT_22)
     results = firewall.apply_firewall(Runner(exec_fn=exec_fn))
     allows = [call for call in exec_fn.calls if call[:2] == ["ufw", "allow"]]
@@ -218,8 +237,8 @@ def test_current_ssh_port_is_allowed_before_deny(monkeypatch: pytest.MonkeyPatch
 
 def test_current_ssh_port_falls_back_to_sshd_t(monkeypatch: pytest.MonkeyPatch) -> None:
     """ss without a process column: use the effective sshd port."""
-    monkeypatch.setattr(firewall, "confirm_twice", lambda plan: True)
-    exec_fn = CurrentPortExec(ss_out="", sshd_t_out="port 22\n")
+    monkeypatch.setattr(firewall, "confirm_once", lambda plan: True)
+    exec_fn = CurrentPortExec(ss_out="LISTEN 0 128 [::]:22 [::]:*\n", sshd_t_out="port 22\n")
     firewall.apply_firewall(Runner(exec_fn=exec_fn))
     allows = [call for call in exec_fn.calls if call[:2] == ["ufw", "allow"]]
     assert ["ufw", "allow", "22/tcp"] in allows
@@ -228,7 +247,7 @@ def test_current_ssh_port_falls_back_to_sshd_t(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_same_port_is_not_duplicated(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(firewall, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(firewall, "confirm_once", lambda plan: True)
     exec_fn = CurrentPortExec(
         ss_out='LISTEN 0 128 0.0.0.0:22345 0.0.0.0:* users:(("sshd",pid=1,fd=3))\n'
     )
@@ -237,49 +256,119 @@ def test_same_port_is_not_duplicated(monkeypatch: pytest.MonkeyPatch) -> None:
     assert allows == [["ufw", "allow", "22345/tcp"]]
 
 
-class NoListenerExec:
-    """ss and sshd -T cannot report a port; every call is recorded."""
+@pytest.mark.parametrize("allow", [(), ("22/tcp",)])
+@pytest.mark.parametrize(
+    ("ss_rc", "fallback_rc", "fallback_out"),
+    [(127, 127, ""), (0, 1, ""), (0, 0, "port bad\n"), (0, 0, "port 65536\n")],
+)
+def test_unverified_standalone_ssh_blocks_all_ufw_commands(
+    fake_exec: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    allow: tuple[str, ...],
+    ss_rc: int,
+    fallback_rc: int,
+    fallback_out: str,
+) -> None:
+    monkeypatch.setattr(firewall, "confirm_once", lambda plan: True)
+    fake_exec.responses.extend(
+        [
+            ("ss -tlnp", ss_rc, "", ""),
+            *ABSENT_SOCKETS,
+            ("sshd -T", fallback_rc, fallback_out, ""),
+        ]
+    )
+    results = firewall.apply_firewall(Runner(exec_fn=fake_exec), allow=allow)
+    assert results[0].status is Status.FAIL
+    assert "local console" in results[0].detail
+    assert "ss -tlnp" in results[0].detail
+    assert "sshd -T" in results[0].detail
+    assert not any(call[:1] == ["ufw"] for call in fake_exec.calls)
 
-    def __init__(self, *, final_status: str | None = None) -> None:
-        self.calls: list[list[str]] = []
-        self.final_status = final_status
-        self.status_calls = 0
 
-    def __call__(self, cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
-        self.calls.append(list(cmd))
-        if cmd == ["ss", "-tlnp"]:
-            return subprocess.CompletedProcess(cmd, 1, "", "ss: not found")
-        if cmd == ["sshd", "-T"]:
-            return subprocess.CompletedProcess(cmd, 1, "", "sshd: not found")
-        if cmd[:3] == ["ufw", "status", "verbose"]:
-            self.status_calls += 1
-            if self.final_status is not None and self.status_calls > 1:
-                return subprocess.CompletedProcess(cmd, 0, self.final_status, "")
-            return subprocess.CompletedProcess(cmd, 0, "Status: inactive\n", "")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-
-def test_no_probed_port_and_no_allow_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(firewall, "confirm_twice", lambda plan: True)
-    exec_fn = NoListenerExec()
+def test_known_empty_probe_without_allow_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(firewall, "confirm_once", lambda plan: True)
+    exec_fn = CurrentPortExec(ss_out="", sshd_t_out="")
     results = firewall.apply_firewall(Runner(exec_fn=exec_fn))
     assert results[0].status is Status.FAIL
     assert "no live SSH listener detected" in results[0].detail
     assert "--allow" in results[0].detail
+    assert "unavailable" not in results[0].detail
     # Fail closed BEFORE any ufw command (not even `ufw status`).
     assert not any(call[:1] == ["ufw"] for call in exec_fn.calls)
 
 
-def test_no_probed_port_with_explicit_allow_proceeds(
+@pytest.mark.parametrize("allow", [(), ("22/tcp",)])
+@pytest.mark.parametrize(
+    ("listen_rc", "listen"),
+    [(1, ""), (0, "[::]:22 (Stream) [::]:2200 (Stream)\n")],
+)
+def test_unverified_active_ssh_socket_blocks_all_ufw_commands(
+    fake_exec: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    allow: tuple[str, ...],
+    listen_rc: int,
+    listen: str,
+) -> None:
+    monkeypatch.setattr(firewall, "confirm_once", lambda plan: True)
+    fake_exec.responses.extend(
+        [
+            (
+                "ss -tlnp",
+                0,
+                'LISTEN 0 128 [::]:22 [::]:* users:(("systemd",pid=1,fd=3))\n'
+                'LISTEN 0 128 [::]:2200 [::]:* users:(("sshd",pid=900,fd=4))\n',
+                "",
+            ),
+            ("systemctl is-active ssh.socket", 0, "active\n", ""),
+            ("systemctl show --property=Listen --value ssh.socket", listen_rc, listen, ""),
+            ("systemctl is-active sshd.socket", 4, "inactive\n", ""),
+        ]
+    )
+    results = firewall.apply_firewall(Runner(exec_fn=fake_exec), allow=allow)
+    assert results[0].status is Status.FAIL
+    assert "active SSH socket" in results[0].detail
+    assert "local console" in results[0].detail
+    assert not any(call[:1] == ["ufw"] for call in fake_exec.calls)
+
+
+@pytest.mark.parametrize("allow", [(), ("22/tcp",)])
+@pytest.mark.parametrize("ss_output", ["", SS_TLN_PORT_22], ids=["fallback-only", "live-sshd"])
+@pytest.mark.parametrize(
+    ("rc", "stderr"),
+    [
+        (1, "Failed to connect to bus: No such file or directory"),
+        (124, "systemctl: timed out after 15.0s"),
+    ],
+    ids=["dbus-failure", "timeout"],
+)
+def test_unknown_ssh_socket_state_blocks_all_ufw_commands(
+    fake_exec: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    allow: tuple[str, ...],
+    ss_output: str,
+    rc: int,
+    stderr: str,
+) -> None:
+    monkeypatch.setattr(firewall, "confirm_once", lambda plan: True)
+    fake_exec.responses.extend(
+        [
+            ("ss -tlnp", 0, ss_output, ""),
+            ("systemctl is-active ssh.socket", rc, "", stderr),
+            ("systemctl is-active sshd.socket", 4, "inactive\n", ""),
+            ("sshd -T", 0, "port 22\n", ""),
+        ]
+    )
+    results = firewall.apply_firewall(Runner(exec_fn=fake_exec), allow=allow)
+    assert results[0].status is Status.FAIL
+    assert not any(call[:1] == ["ufw"] for call in fake_exec.calls)
+    assert "determine SSH socket state" in results[0].detail
+
+
+def test_known_empty_probe_with_explicit_allow_proceeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(firewall, "confirm_twice", lambda plan: True)
-    exec_fn = NoListenerExec(
-        final_status="Status: active\n"
-        "Default: deny (incoming), allow (outgoing), disabled (routed)\n\n"
-        "To   Action   From\n--   ------   ----\n"
-        "22345/tcp  ALLOW IN  Anywhere\n22/tcp  ALLOW IN  Anywhere\n"
-    )
+    monkeypatch.setattr(firewall, "confirm_once", lambda plan: True)
+    exec_fn = CurrentPortExec(ss_out="", sshd_t_out="")
     results = firewall.apply_firewall(Runner(exec_fn=exec_fn), allow=["22/tcp"])
     allows = [call for call in exec_fn.calls if call[:2] == ["ufw", "allow"]]
     assert ["ufw", "allow", "22/tcp"] in allows
@@ -313,7 +402,7 @@ def test_inbound_rule_spellings_are_recognized(action: str) -> None:
 def test_verify_fails_when_only_a_forward_rule_exists(
     fake_exec: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(firewall, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(firewall, "confirm_once", lambda plan: True)
     forward_only = checks.UfwStatus(
         active=True,
         default_incoming="deny",
@@ -321,13 +410,16 @@ def test_verify_fails_when_only_a_forward_rule_exists(
         rules=[checks.UfwRule(to="22345/tcp", action="ALLOW FWD", source="Anywhere")],
     )
     monkeypatch.setattr(checks, "ufw_status", lambda runner: forward_only)
-    fake_exec.responses.append(
-        (
-            "ss -tlnp",
-            0,
-            'LISTEN 0 128 0.0.0.0:22345 0.0.0.0:* users:(("sshd",pid=1,fd=3))\n',
-            "",
-        )
+    fake_exec.responses.extend(
+        [
+            (
+                "ss -tlnp",
+                0,
+                'LISTEN 0 128 0.0.0.0:22345 0.0.0.0:* users:(("sshd",pid=1,fd=3))\n',
+                "",
+            ),
+            *ABSENT_SOCKETS,
+        ]
     )
     results = firewall.apply_firewall(Runner(exec_fn=fake_exec))
     # The forward rule must not make lhm believe the inbound rule is in place.

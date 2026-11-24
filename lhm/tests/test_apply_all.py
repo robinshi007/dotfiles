@@ -1,3 +1,4 @@
+import base64
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -61,12 +62,10 @@ def test_apply_all_runs_modules_in_order(
     monkeypatch.setattr(backup_module, "SCRIPT", root / "lhm-backup.sh")
     monkeypatch.setattr(backup_module, "SERVICE_UNIT", root / "systemd" / "lhm-backup.service")
     monkeypatch.setattr(backup_module, "TIMER_UNIT", root / "systemd" / "lhm-backup.timer")
-    # Never write into the real /home or /etc/ssh during a test.
+    # Model the account and helper result without touching a home directory.
     home = tmp_path / "home"
-    (home / "testadmin" / ".ssh").mkdir(parents=True)
-    (home / "testadmin" / ".ssh" / "authorized_keys").write_text(
-        KEY + " testadmin@old\n", encoding="utf-8"
-    )
+    account_home = home / "testadmin"
+    installed_key = KEY + " robin@test\n"
     monkeypatch.setattr(ssh, "HOME_ROOT", home)
     monkeypatch.setattr(ssh, "SSHD_DROPIN", root / "ssh" / "99-lhm.conf")
     seen: list[str] = []
@@ -74,6 +73,18 @@ def test_apply_all_runs_modules_in_order(
 
     def exec_fn(cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
         seen.append(" ".join(cmd))
+        if cmd == ["/usr/bin/getent", "passwd", "testadmin"]:
+            passwd = f"testadmin:x:1201:1202::{account_home}:/bin/bash\n"
+            return subprocess.CompletedProcess(cmd, 0, passwd, "")
+        if cmd[0] == "/usr/bin/setpriv":
+            op = cmd[cmd.index("lhm-userkeys") + 1]
+            assert cmd[1:5] == ["--reuid", "1201", "--regid", "1202"]
+            if op == "ensure":
+                frame = "CHANGED 0"
+            else:
+                assert op == "probe"
+                frame = "STATE 1 0600 " + base64.b64encode(installed_key.encode()).decode()
+            return subprocess.CompletedProcess(cmd, 0, f"LHM_USERKEYS_V1 {frame}\n", "")
         if cmd[:3] == ["ufw", "status", "verbose"]:
             if "ufw" not in configured:
                 return subprocess.CompletedProcess(cmd, 1, "", "ERROR: not configured")
@@ -104,6 +115,11 @@ def test_apply_all_runs_modules_in_order(
             archive.with_name(archive.name + ".sha256").write_text("x\n", encoding="utf-8")
         if cmd[:4] == ["systemctl", "show", "-p", "LoadState"]:
             return subprocess.CompletedProcess(cmd, 0, "loaded\n", "")
+        if cmd in (
+            ["systemctl", "is-active", "ssh.socket"],
+            ["systemctl", "is-active", "sshd.socket"],
+        ):
+            return subprocess.CompletedProcess(cmd, 3, "inactive\n", "")
         if cmd == ["ss", "-tlnp"]:
             # A hardened host: sshd already listens on 22345 (anti-lockout probe).
             out = (
@@ -120,9 +136,10 @@ def test_apply_all_runs_modules_in_order(
         return subprocess.CompletedProcess(cmd, 0, "active\n", "")
 
     key = tmp_path / "id.pub"
-    key.write_text(KEY + " robin@test\n", encoding="utf-8")
+    key.write_text(installed_key, encoding="utf-8")
     monkeypatch.setattr(cli, "Runner", lambda **kw: Runner(exec_fn=exec_fn, **kw))
     monkeypatch.setattr(cli, "is_root", lambda: True)
+    monkeypatch.setattr(ssh, "geteuid", lambda: 1200)
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda prompt="": "y")
 
@@ -224,9 +241,11 @@ def test_query_sysctl_and_audit(
 
 
 def test_check_lists_all_eleven_areas_without_unknown(
-    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
     monkeypatch.setattr(cli, "Runner", lambda **kw: Runner(exec_fn=fake_exec, **kw))
+    monkeypatch.setattr(cli.ssh_module, "HOME_ROOT", tmp_path / "absent-home")
     assert cli.main(["check"]) == 0
     out = capsys.readouterr().out
     for module in MODULES:

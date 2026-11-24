@@ -50,6 +50,65 @@ expect_lhm_ok() {
     assert_eq "$LHM_RC" 0 "$1 (exit 0)"
 }
 
+# --- SSH watchdog (02 and 08) ------------------------------------------------
+require_ssh_test_container() {
+    if [[ ${container:-} != docker || ! -f /.dockerenv ||
+          ! -d /run/systemd/system || $EUID != 0 ]]; then
+        fail "SSH scenarios require a fresh lhm systemd test container"
+        finish
+    fi
+}
+
+setup_ssh_test_client() {
+    local host_key
+    host_key=$(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub) || return 1
+    printf '%s %s\n' 127.0.0.1 "$host_key" '[127.0.0.1]:22345' "$host_key" \
+        > /root/lhm-test-known-hosts || return 1
+    SSH_OPTS=(-F /dev/null -o StrictHostKeyChecking=yes
+              -o UserKnownHostsFile=/root/lhm-test-known-hosts -o GlobalKnownHostsFile=/dev/null
+              -o HostKeyAlgorithms=ssh-ed25519 -o IdentitiesOnly=yes -o BatchMode=yes
+              -o ConnectTimeout=10)
+
+    # Container only: keep sshd's context and let 02 try the test bypass.
+    install -m 0440 /dev/null /etc/sudoers.d/lhm-integration || return 1
+    cat > /etc/sudoers.d/lhm-integration <<'EOF' || return 1
+Defaults:deploy env_keep += "SSH_CONNECTION LHM_CONFIRM_BYPASS"
+deploy ALL=(root) NOPASSWD: /usr/local/bin/lhm apply ssh-hardening, /usr/local/bin/lhm ssh-confirm *
+EOF
+    visudo -cf /etc/sudoers.d/lhm-integration
+}
+
+# Each call opens a fresh connection; args are fixed words or the validated ID.
+run_ssh_lhm() {
+    local port=$1 answers=$2
+    shift 2
+    printf -- '-- SSH on %s: sudo lhm %s\n' "$port" "$*"
+    LHM_OUT=$(ssh "${SSH_OPTS[@]}" -tt -p "$port" -i /root/deploy deploy@127.0.0.1 \
+        sudo -n /usr/local/bin/lhm "$@" <<< "$answers" 2>&1)
+    LHM_RC=$?
+    printf '%s\n' "$LHM_OUT" | tr -d '\r' | sed 's/^/    /'
+}
+
+apply_ssh_pending() {
+    run_ssh_lhm 22 y apply ssh-hardening
+    if [[ $LHM_RC != 0 ]]; then
+        fail "apply ssh-hardening did not reach pending (exit $LHM_RC)"
+        return 1
+    fi
+    LHM_SSH_ID=$(grep -oE 'lhm ssh-confirm [[:alnum:]_-]+' <<< "$LHM_OUT" | cut -d' ' -f3 | sort -u)
+    if [[ ! $LHM_SSH_ID =~ ^[[:alnum:]][[:alnum:]_-]*$ ]]; then
+        fail "pending SSH apply did not report exactly one ssh-confirm ID"
+        return 1
+    fi
+    ok "SSH apply reported a pending confirmation ID"
+}
+
+confirm_ssh_pending() {
+    run_ssh_lhm 22345 y ssh-confirm "$LHM_SSH_ID"
+    expect_lhm_ok "confirm SSH hardening via a fresh key login, sudo and one TTY answer"
+    [[ $LHM_RC == 0 ]]
+}
+
 # --- kernel.global sysctls ----------------------------------------------------
 # kernel.* sysctls are NOT namespaced: a container writing them changes the
 # HOST kernel. The template sets a few that are irreversible or disruptive in a

@@ -113,8 +113,8 @@ for path in "${CHOSEN[@]}"; do
         continue
     fi
 
-    # LHM_CONFIRM_BYPASS=1 is the documented test escape hatch: it skips the
-    # two y/N prompts only (idempotency checks still run first).
+    # LHM_CONFIRM_BYPASS=1 skips the single prompt for commands that allow it.
+    # Idempotency checks still run first.
     # `timeout` bounds a scenario that wedges (e.g. a hung apt lock); 124 then
     # shows up as a normal failure instead of blocking CI forever.
     timeout --kill-after=30 "$SCENARIO_TIMEOUT" \

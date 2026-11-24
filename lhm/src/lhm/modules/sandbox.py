@@ -4,10 +4,9 @@ import re
 from collections.abc import Sequence
 from pathlib import Path
 
-from lhm.core import colors
-from lhm.core.backup import newest_backup, rollback_file
-from lhm.core.confirm import confirm_twice
-from lhm.core.files import write_dropin
+from lhm.core.backup import rollback_file
+from lhm.core.confirm import confirm_once
+from lhm.core.files import notify_file_change, remove_file, write_dropin
 from lhm.core.report import Status, StepResult
 from lhm.core.runner import CommandError, Runner
 
@@ -179,17 +178,23 @@ def apply_sandbox(runner: Runner, *, services: Sequence[str] = ()) -> list[StepR
         results.append(StepResult("daemon-reload", Status.SKIPPED, "no drop-in changed"))
         return [*results, *_verify_all(runner, usable)]
 
-    if not confirm_twice(plan):
+    if not confirm_once(plan):
         return [StepResult("sandbox", Status.ABORTED, "aborted; no changes made")]
 
     results = [
         StepResult(f"skip {unit_name(s)}", Status.SKIPPED, "unit not installed")
         for s in missing
     ]
+    changes: dict[str, Path | None] = {}
     try:
         for service in usable:
             if service in pending:
-                outcome = write_dropin(dropin_path(service), desired_dropin(service))
+                backups: list[Path] = []
+                outcome = write_dropin(
+                    dropin_path(service), desired_dropin(service), on_backup=backups.append
+                )
+                if outcome == "written":
+                    changes[service] = backups[0] if backups else None
                 results.append(
                     StepResult(
                         f"write {dropin_path(service)}",
@@ -207,10 +212,13 @@ def apply_sandbox(runner: Runner, *, services: Sequence[str] = ()) -> list[StepR
             if not restart.ok:
                 # A broken unit would leave the service down: restore the previous
                 # drop-in automatically instead of only printing a hint.
-                restored = _rollback_dropin(service)
-                if restored:
+                restored = "no drop-in change to undo"
+                if service in changes:
+                    restored = _rollback_dropin(service, changes[service])
                     runner.run(["systemctl", "daemon-reload"], check=False)
-                    runner.run(["systemctl", "restart", unit_name(service)], check=False)
+                    retry = runner.run(["systemctl", "restart", unit_name(service)], check=False)
+                    if not retry.ok:
+                        restored += "; recovery restart failed; inspect service from the console"
                 detail = f"restart failed (rc={restart.returncode})"
                 if restart.stderr.strip():
                     detail += f": {restart.stderr.strip()}"
@@ -218,7 +226,7 @@ def apply_sandbox(runner: Runner, *, services: Sequence[str] = ()) -> list[StepR
                 results.append(StepResult(f"restart {unit_name(service)}", Status.FAIL, detail))
                 return results
             results.append(StepResult(f"restart {unit_name(service)}", Status.CHANGED))
-    except (CommandError, OSError) as exc:
+    except (CommandError, OSError, ValueError) as exc:
         results.append(StepResult("sandbox", Status.FAIL, str(exc)))
         for service in usable:
             if dropin_path(service).exists():
@@ -229,20 +237,20 @@ def apply_sandbox(runner: Runner, *, services: Sequence[str] = ()) -> list[StepR
     return [*results, *_verify_all(runner, usable)]
 
 
-def _rollback_dropin(service: str) -> str:
-    """Restore the newest backup of the drop-in, or delete a newly created one."""
+def _rollback_dropin(service: str, backup: Path | None) -> str:
+    """Restore this run's backup of the drop-in, or delete a newly created one."""
     path = dropin_path(service)
-    backup = newest_backup(path)
     if backup is not None:
-        rollback_file(path)
+        rollback_file(path, backup=backup)
         return f"restored {backup.name}"
     if path.exists():
         try:
             old = path.read_text(encoding="utf-8")
         except OSError:
             old = None
-        path.unlink()
-        colors.file_change("deleted", path, old=old)
+        if not remove_file(path):
+            return "drop-in removal suppressed"
+        notify_file_change("deleted", path, old=old)
         return "removed the new drop-in"
     return "no drop-in to roll back"
 

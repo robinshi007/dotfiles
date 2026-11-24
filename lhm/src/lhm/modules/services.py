@@ -129,7 +129,7 @@ def listing(runner: Runner) -> tuple[str, list[ServiceItem]]:
 
 
 def _final_confirm(plan: Sequence[str]) -> bool:
-    """Single y/N after the selection step (the selection is confirmation one)."""
+    """Ask for one confirmation after collecting the unit selection."""
     if not sys.stdin.isatty():
         print(
             "lhm: refusing to continue: stdin is not a TTY "
@@ -180,7 +180,7 @@ def apply_cleanup_services(runner: Runner, *, select: str = "") -> list[StepResu
             answer = input("selection: ")
         except EOFError:
             print("lhm: aborted: no input available.", file=sys.stderr)
-            return [StepResult("cleanup-services", Status.SKIPPED, "aborted; no input")]
+            return [StepResult("cleanup-services", Status.ABORTED, "aborted; no input available")]
     try:
         chosen = parse_selection(answer, len(items))
     except SelectionError as exc:

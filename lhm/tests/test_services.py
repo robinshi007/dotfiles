@@ -102,11 +102,22 @@ class StatefulExec:
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
 
-def test_cleanup_disables_selected_units_only(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("select", ["", "1"])
+def test_cleanup_disables_selected_units_only(monkeypatch: pytest.MonkeyPatch, select: str) -> None:
+    expected_prompts = ["Disable these units now? type 'y' to continue: "]
+    if not select:
+        expected_prompts.insert(0, "selection: ")
+    prompts: list[str] = []
+
+    def answer(prompt: str) -> str:
+        prompts.append(prompt)
+        return "1" if prompt == "selection: " else "y"
+
     monkeypatch.setattr(services.sys.stdin, "isatty", lambda: True)
-    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    monkeypatch.setattr("builtins.input", answer)
     enabled = StatefulExec()
-    results = services.apply_cleanup_services(Runner(exec_fn=enabled), select="1")
+    results = services.apply_cleanup_services(Runner(exec_fn=enabled), select=select)
+    assert prompts == expected_prompts
     assert results[0].status is Status.CHANGED
     assert results[0].name == "disable --now nginx.service"
     assert results[-1].status is Status.OK
@@ -118,6 +129,21 @@ def test_cleanup_disables_selected_units_only(monkeypatch: pytest.MonkeyPatch) -
 def test_cleanup_none_selected_is_skipped(enabled: Any) -> None:
     results = services.apply_cleanup_services(Runner(exec_fn=enabled), select="none")
     assert results[0].status is Status.SKIPPED
+    assert results[0].detail == "nothing selected"
+    assert not any(call[:2] == ["systemctl", "disable"] for call in enabled.calls)
+
+
+def test_cleanup_eof_is_aborted(
+    enabled: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def eof(prompt: str = "") -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", eof)
+    results = services.apply_cleanup_services(Runner(exec_fn=enabled))
+    assert results[0].status is Status.ABORTED
+    assert "no input" in results[0].detail
+    assert "aborted" in capsys.readouterr().err
     assert not any(call[:2] == ["systemctl", "disable"] for call in enabled.calls)
 
 

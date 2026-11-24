@@ -3,7 +3,7 @@
 from collections.abc import Sequence
 
 from lhm.core import checks
-from lhm.core.confirm import confirm_twice
+from lhm.core.confirm import confirm_once
 from lhm.core.report import Status, StepResult
 from lhm.core.runner import CommandError, Runner
 
@@ -52,6 +52,20 @@ def apply_firewall(runner: Runner, *, allow: Sequence[str] = ()) -> list[StepRes
     # Probe the ports sshd listens on RIGHT NOW: a server still on 22 must not
     # lose its listener when ufw flips to default deny incoming.
     current = [] if runner.dry_run else checks.current_ssh_ports(runner)
+    if current is None:
+        return [
+            StepResult(
+                "firewall",
+                Status.FAIL,
+                "could not determine SSH socket state, verify all listener ports "
+                "for an active SSH socket, or verify a standalone port via "
+                "`ss -tlnp` and fallback `sshd -T`; no ufw commands run. "
+                "From the local console, check `systemctl is-active ssh.socket sshd.socket` "
+                "and compare `systemctl show --property=Listen ssh.socket sshd.socket` "
+                "with `sudo ss -tlnp`. If neither socket is active, verify that "
+                "`sudo sshd -T` succeeds and reports valid Port values, then retry",
+            )
+        ]
     if not runner.dry_run and not current and not extra:
         # Fail closed: with no probed listener and no --allow, default deny can
         # only lock the operator out. Nothing is run (not even `ufw status`).
@@ -59,10 +73,9 @@ def apply_firewall(runner: Runner, *, allow: Sequence[str] = ()) -> list[StepRes
             StepResult(
                 "firewall",
                 Status.FAIL,
-                "no live SSH listener detected (ss/sshd -T unavailable): refusing "
-                "default deny incoming; install iproute2/openssh-server so the port "
-                "can be probed, or re-run with --allow PORT/tcp naming the port you "
-                "are connected to",
+                "no live SSH listener detected: refusing default deny incoming; "
+                "from the local console, verify the port you need to keep open, "
+                "then re-run with --allow PORT/tcp",
             )
         ]
     if not runner.dry_run and not current:
@@ -140,7 +153,7 @@ def apply_firewall(runner: Runner, *, allow: Sequence[str] = ()) -> list[StepRes
     if not missing and enabled and deny_default and outgoing_default:
         return [StepResult("firewall", Status.SKIPPED, "rules and defaults already in place")]
 
-    if not confirm_twice(plan):
+    if not confirm_once(plan):
         return [StepResult("firewall", Status.ABORTED, "aborted; no changes made")]
 
     results = []

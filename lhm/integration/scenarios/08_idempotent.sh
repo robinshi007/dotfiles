@@ -3,7 +3,14 @@
 # report no CHANGED, exit 0, and leave every managed file byte-identical.
 . /opt/scenarios/lib.sh
 
+require_ssh_test_container
 ssh-keygen -q -t ed25519 -N '' -f /root/deploy
+
+run_lhm apply ssh-user deploy --key /root/deploy.pub --sudo
+expect_lhm_ok "first apply ssh-user"
+setup_ssh_test_client || { fail "configure the SSH test client and sudo"; finish; }
+apply_ssh_pending || finish
+confirm_ssh_pending || finish
 
 # `apply sysctl` below touches kernel.* keys that are NOT namespaced; shield the
 # one-way / container-breaking ones and restore the observable ones (see lib.sh).
@@ -11,10 +18,6 @@ shield_kernel_keys
 save_kernel_keys kernel.kptr_restrict kernel.dmesg_restrict
 trap restore_kernel_keys EXIT
 
-run_lhm apply ssh-user deploy --key /root/deploy.pub
-expect_lhm_ok "first apply ssh-user"
-run_lhm apply ssh-hardening
-expect_lhm_ok "first apply ssh-hardening"
 run_lhm apply sysctl
 expect_lhm_ok "first apply sysctl"
 run_lhm apply fail2ban
@@ -56,7 +59,7 @@ printf '%s\n' "$after" | sed 's/^/    after | /'
 assert_eq "$after" "$before" "managed files and .bak set unchanged (sha256sum)"
 
 # ssh-user is idempotent too (user exists, key present).
-run_lhm apply ssh-user deploy --key /root/deploy.pub
+run_lhm apply ssh-user deploy --key /root/deploy.pub --sudo
 expect_lhm_ok "second apply ssh-user"
 assert_not_contains "$LHM_OUT" "CHANGED" "second apply ssh-user: no CHANGED"
 

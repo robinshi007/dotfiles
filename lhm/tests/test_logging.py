@@ -33,7 +33,7 @@ def test_dry_run_plans_and_writes_nothing(
 def test_apply_creates_dropin_dir_and_verifies(
     fake_exec: Any, paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(logging, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(logging, "confirm_once", lambda plan: True)
     paths["journal_dir"].mkdir(parents=True)
     results = logging.apply_logging(Runner(exec_fn=fake_exec))
     names = {r.name: r.status for r in results}
@@ -51,7 +51,7 @@ def test_apply_creates_dropin_dir_and_verifies(
 def test_verify_fails_when_journal_dir_missing(
     fake_exec: Any, paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(logging, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(logging, "confirm_once", lambda plan: True)
     results = logging.apply_logging(Runner(exec_fn=fake_exec))
     verify = next(r for r in results if r.name == "verify")
     assert verify.status is Status.FAIL
@@ -61,7 +61,7 @@ def test_verify_fails_when_journal_dir_missing(
 def test_second_run_skips_everything(
     fake_exec: Any, paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(logging, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(logging, "confirm_once", lambda plan: True)
     paths["journal_dir"].mkdir(parents=True)
     logging.apply_logging(Runner(exec_fn=fake_exec))
     fake_exec.calls.clear()

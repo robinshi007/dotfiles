@@ -74,7 +74,7 @@ def test_target_with_single_quote_refused(fake_exec: Any, paths: dict[str, Path]
 def test_backup_dir_is_0700_and_script_umasks_077(
     paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(backup, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(backup, "confirm_once", lambda plan: True)
     calls: list[list[str]] = []
     runner = _runner(calls, on_script=(paths["script"], lambda: _write_archive(paths["target"])))
     backup.apply_backup(runner, target=str(paths["target"]), keep=7)
@@ -105,7 +105,7 @@ def test_dry_run_writes_nothing(fake_exec: Any, paths: dict[str, Path]) -> None:
 def test_apply_runs_script_once_and_checks_archive(
     paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(backup, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(backup, "confirm_once", lambda plan: True)
     calls: list[list[str]] = []
     runner = _runner(calls, on_script=(paths["script"], lambda: _write_archive(paths["target"])))
     results = backup.apply_backup(runner, target=str(paths["target"]), keep=7)
@@ -133,7 +133,7 @@ def test_apply_runs_script_once_and_checks_archive(
 def test_missing_manifest_fails_verification(
     paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(backup, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(backup, "confirm_once", lambda plan: True)
     calls: list[list[str]] = []
     runner = _runner(
         calls, on_script=(paths["script"], lambda: _write_archive(paths["target"], False))

@@ -32,6 +32,8 @@ class AptBackend:
     def _require_apt(self) -> None:
         if self._available is None:
             probe = self.runner.run([APT_GET, "--version"], timeout=15.0, check=False)
+            if probe.was_dry_run:
+                return  # plan without asserting that apt is available
             self._available = probe.ok
         if not self._available:
             raise DistroError("apt-get not found: lhm supports Debian/Ubuntu with apt only")

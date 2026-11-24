@@ -196,6 +196,53 @@ def test_invalid_duration_is_refused(fake_exec: Any, files: Path) -> None:
     assert not (files / "jail.d" / "99-lhm.local").exists()
 
 
+@pytest.mark.parametrize("value", ["0", "0s", "0m", "0h", "0d", "0w"])
+@pytest.mark.parametrize("field", ["bantime", "findtime"])
+def test_zero_duration_is_refused(
+    fake_exec: Any, files: Path, field: str, value: str
+) -> None:
+    results = fail2ban.apply_fail2ban(Runner(exec_fn=fake_exec), **{field: value})
+    assert results[0].status is Status.FAIL
+    assert f"invalid {field}" in results[0].detail
+    assert "strictly positive" in results[0].detail
+    assert fake_exec.calls == []
+    assert not (files / "jail.d" / "99-lhm.local").exists()
+
+
+@pytest.mark.parametrize("field", ["maxretry", "caddy_maxretry"])
+def test_zero_retry_is_refused(fake_exec: Any, files: Path, field: str) -> None:
+    results = fail2ban.apply_fail2ban(Runner(exec_fn=fake_exec), caddy=True, **{field: "0"})
+    assert results[0].status is Status.FAIL
+    assert f"invalid {field}" in results[0].detail
+    assert "strictly positive" in results[0].detail
+    assert fake_exec.calls == []
+    assert not (files / "jail.d" / "99-lhm.local").exists()
+
+
+@pytest.mark.parametrize("value", ["3h", "3s", "3m", "3d", "3w", "1.5", "-1", "abc", ""])
+@pytest.mark.parametrize("field", ["maxretry", "caddy_maxretry"])
+def test_unit_suffixed_or_non_numeric_retry_is_refused(
+    fake_exec: Any, files: Path, field: str, value: str
+) -> None:
+    results = fail2ban.apply_fail2ban(Runner(exec_fn=fake_exec), caddy=True, **{field: value})
+    assert results[0].status is Status.FAIL
+    assert f"invalid {field}" in results[0].detail
+    assert "positive integer" in results[0].detail
+    assert fake_exec.calls == []
+    assert not (files / "jail.d" / "99-lhm.local").exists()
+
+
+def test_valid_durations_and_retries_still_render() -> None:
+    text = fail2ban.desired_conf(
+        bantime="3600", findtime="1h", maxretry="7", caddy=True, caddy_maxretry="9"
+    )
+    sshd = text.split("[sshd]")[1].split("[caddy]")[0]
+    assert "bantime = 3600" in sshd
+    assert "findtime = 1h" in sshd
+    assert "maxretry = 7" in sshd
+    assert "maxretry = 9" in text.split("[caddy]")[1]
+
+
 def test_legacy_jail_local_is_never_written(fake_exec: Any, files: Path) -> None:
     legacy = files / "jail.local"
     legacy.parent.mkdir(parents=True)
@@ -210,7 +257,7 @@ def test_apply_never_writes_the_legacy_jail_local(
 ) -> None:
     from lhm.modules import fail2ban as module
 
-    monkeypatch.setattr(fail2ban, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
 
     written: list[Path] = []
     real = module.write_dropin
@@ -288,7 +335,7 @@ def test_caddy_warns_when_unit_cannot_be_probed(
 def test_apply_installs_writes_and_verifies(
     fake_exec: Any, files: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(fail2ban, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
     fake_exec.responses.extend(
         [
             ("dpkg-query -W -f=${Status} fail2ban", 1, "", "not installed"),
@@ -323,7 +370,7 @@ def test_apply_installs_writes_and_verifies(
 def test_apply_caddy_writes_filter_and_enables_jail(
     fake_exec: Any, files: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(fail2ban, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
     _fake_tools(fake_exec)
     fake_exec.responses.extend(
         [
@@ -359,7 +406,7 @@ def test_restart_jails_when_already_active(
     """
     (files / "jail.d").mkdir(parents=True)
     (files / "jail.d" / "99-lhm.local").write_text("[DEFAULT]\n", encoding="utf-8")
-    monkeypatch.setattr(fail2ban, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
     _fake_tools(fake_exec, active=True)
     results = fail2ban.apply_fail2ban(Runner(exec_fn=fake_exec))
     executed = [" ".join(call) for call in fake_exec.calls]
@@ -379,7 +426,7 @@ def test_restart_path_enables_when_inactive(
 ) -> None:
     (files / "jail.d").mkdir(parents=True)
     (files / "jail.d" / "99-lhm.local").write_text("[DEFAULT]\n", encoding="utf-8")
-    monkeypatch.setattr(fail2ban, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
     _fake_tools(fake_exec, active=False)
     fail2ban.apply_fail2ban(Runner(exec_fn=fake_exec))
     executed = [" ".join(call) for call in fake_exec.calls]
@@ -397,7 +444,7 @@ def test_second_run_is_idempotent(
     dbfile = files.parent / "lib" / "fail2ban.sqlite3"
     dbfile.parent.mkdir(parents=True)
     dbfile.write_bytes(b"db")
-    monkeypatch.setattr(fail2ban, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
     _fake_tools(fake_exec)
     results = fail2ban.apply_fail2ban(Runner(exec_fn=fake_exec))
     statuses = [r.status for r in results]
@@ -415,7 +462,7 @@ def test_second_run_is_idempotent(
 def test_verify_fails_without_sshd_jail(
     fake_exec: Any, files: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(fail2ban, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
     fake_exec.responses.extend(
         [
             ("dpkg-query", 0, "install ok installed", ""),
@@ -436,7 +483,7 @@ def test_verify_degrades_to_skipped_without_client(
     The service is inactive here: with an active daemon the jail restart goes
     through fail2ban-client, so a missing client is a hard failure, not a skip.
     """
-    monkeypatch.setattr(fail2ban, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
     fake_exec.responses.extend(
         [
             ("dpkg-query", 0, "install ok installed", ""),
@@ -452,7 +499,7 @@ def test_verify_degrades_to_skipped_without_client(
 def test_verify_skips_bantime_when_client_cannot_read(
     fake_exec: Any, files: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(fail2ban, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
     _fake_tools(fake_exec)
     fake_exec.responses.insert(
         3, ("fail2ban-client get sshd bantime", 255, "", "permission denied")

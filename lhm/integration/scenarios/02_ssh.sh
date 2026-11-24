@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # 02: SSH anti-lockout chain end to end.
 #   deploy user + authorized_keys -> sshd drop-in -> socket unit dance -> reload
-#   -> sshd -T agreement -> real TCP listener -> real key login (and real
-#   rejection with a wrong key).
+#   -> sshd -T agreement -> real TCP listener -> real key login and watchdog
+#   confirmation (and real rejection with a wrong key).
 . /opt/scenarios/lib.sh
 
+require_ssh_test_container
 ssh-keygen -q -t ed25519 -N '' -f /root/deploy
 ssh-keygen -q -t ed25519 -N '' -f /root/wrong
-install -d -m 0700 /root/.ssh
 
 # Container-specific safety: the base image enables ssh.socket (Debian/Ubuntu
 # 24.04 default), so lhm must disable it or port 22345 would never listen.
 printf '  info  before: ssh.socket=%s ssh.service=%s\n' \
     "$(systemctl is-enabled ssh.socket 2>&1)" "$(systemctl is-enabled ssh.service 2>&1)"
 
-run_lhm apply ssh-user deploy --key /root/deploy.pub
+run_lhm apply ssh-user deploy --key /root/deploy.pub --sudo
 expect_lhm_ok "apply ssh-user deploy"
 
 assert_eq "$(id -u deploy 2>&1 | grep -c .)" "1" "deploy user exists"
@@ -24,8 +24,8 @@ assert_eq "$(stat -c '%U' /home/deploy/.ssh/authorized_keys)" "deploy" "authoriz
 assert_contains "$(cat /home/deploy/.ssh/authorized_keys)" "$(cut -d' ' -f1,2 /root/deploy.pub)" \
     "public key installed"
 
-run_lhm apply ssh-hardening
-expect_lhm_ok "apply ssh-hardening"
+setup_ssh_test_client || { fail "configure the SSH test client and sudo"; finish; }
+apply_ssh_pending || finish
 
 assert_file /etc/ssh/sshd_config.d/99-lhm.conf "99-lhm.conf drop-in written"
 assert_contains "$(cat /etc/ssh/sshd_config.d/99-lhm.conf)" "Port 22345" "drop-in sets Port 22345"
@@ -49,17 +49,23 @@ assert_not_contains "$listening" ":22 " "sshd no longer LISTENs on 22"
 
 if systemctl is-active --quiet ssh; then ok "ssh.service active"; else fail "ssh.service inactive"; fi
 
-SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes
-          -o ConnectTimeout=10 -p 22345)
-
 # Real end-to-end login: the only network path this test accepts.
-if out=$(ssh "${SSH_OPTS[@]}" -i /root/deploy deploy@localhost true 2>&1); then
-    ok "ssh key login works (deploy@localhost:22345)"
+if out=$(ssh "${SSH_OPTS[@]}" -p 22345 -i /root/deploy deploy@127.0.0.1 true 2>&1); then
+    ok "ssh key login works (deploy@127.0.0.1:22345)"
 else
     fail "ssh key login failed: $(printf '%s' "$out" | tail -n 3 | tr '\n' '|')"
 fi
 
-if out=$(ssh "${SSH_OPTS[@]}" -i /root/wrong deploy@localhost true 2>&1); then
+# Even the test bypass cannot confirm from a real SSH session without a TTY.
+if out=$(ssh "${SSH_OPTS[@]}" -T -p 22345 -i /root/deploy deploy@127.0.0.1 \
+        LHM_CONFIRM_BYPASS=1 sudo -n /usr/local/bin/lhm ssh-confirm "$LHM_SSH_ID" </dev/null 2>&1); then
+    fail "ssh-confirm accepted the test bypass without a TTY"
+else
+    assert_contains "$out" "TTY" "ssh-confirm refuses a non-TTY even with the test bypass"
+fi
+confirm_ssh_pending || finish
+
+if out=$(ssh "${SSH_OPTS[@]}" -p 22345 -i /root/wrong deploy@127.0.0.1 true 2>&1); then
     fail "ssh accepted a wrong key"
 else
     ok "ssh rejects a wrong key (rc=$?)"
@@ -67,8 +73,8 @@ fi
 
 # Password auth must be refused as well (no password is set anyway; this
 # asserts the config really is key-only rather than silently falling back).
-if out=$(ssh "${SSH_OPTS[@]}" -o PreferredAuthentications=password -o PubkeyAuthentication=no \
-        -i /root/deploy deploy@localhost true 2>&1); then
+if out=$(ssh "${SSH_OPTS[@]}" -p 22345 -o PreferredAuthentications=password \
+        -o PubkeyAuthentication=no -i /root/deploy deploy@127.0.0.1 true 2>&1); then
     fail "password authentication was accepted"
 else
     ok "password authentication refused"

@@ -1,12 +1,17 @@
 """Backup module: systemd timer + tar script with sha256 manifest and rotation."""
 
-import os
 import re
 from pathlib import Path
 
 from lhm.core.checks import probe_service
-from lhm.core.confirm import confirm_twice
-from lhm.core.files import render_shell_template, render_template, write_dropin
+from lhm.core.confirm import confirm_once
+from lhm.core.files import (
+    ensure_dir,
+    render_shell_template,
+    render_template,
+    set_mode,
+    write_dropin,
+)
 from lhm.core.report import Status, StepResult
 from lhm.core.runner import CommandError, Runner
 
@@ -174,19 +179,19 @@ def apply_backup(
                 verify,
             ]
 
-    if not confirm_twice(plan):
+    if not confirm_once(plan):
         return [StepResult("backup", Status.ABORTED, "aborted; no changes made")]
 
     results: list[StepResult] = []
     try:
-        target_dir.mkdir(parents=True, exist_ok=True)
+        ensure_dir(target_dir, mode=0o700)
         # 0700: archives hold /etc (shadow, keys), keep them root-only.
-        os.chmod(target_dir, 0o700)
+        set_mode(target_dir, 0o700)
         results.append(StepResult(f"mkdir {target_dir}", Status.OK, "0700"))
         if script_needed:
-            SCRIPT.parent.mkdir(parents=True, exist_ok=True)
+            ensure_dir(SCRIPT.parent)
             write_dropin(SCRIPT, script)
-            os.chmod(SCRIPT, 0o755)
+            set_mode(SCRIPT, 0o755)
             results.append(StepResult(f"install {SCRIPT}", Status.CHANGED, "0755"))
         else:
             results.append(StepResult(f"install {SCRIPT}", Status.SKIPPED, "already current"))

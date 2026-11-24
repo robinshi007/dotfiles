@@ -42,7 +42,7 @@ def test_https_only_enforcement(url: str, fake_exec: Any, paths: dict[str, Path]
 def test_apply_installs_script_and_units(
     fake_exec: Any, paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(alert, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(alert, "confirm_once", lambda plan: True)
     fake_exec.responses.append(("systemctl is-active lhm-alert.timer", 0, "active\n", ""))
     results = alert.apply_alert(
         Runner(exec_fn=fake_exec), webhook="https://hooks.example/services/abc"
@@ -66,14 +66,14 @@ def test_apply_installs_script_and_units(
 def test_rotated_script_backup_keeps_0700(
     fake_exec: Any, paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(alert, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(alert, "confirm_once", lambda plan: True)
     paths["script"].parent.mkdir(parents=True)
     paths["script"].write_text("WEBHOOK_URL='https://old.example/x'\n", encoding="utf-8")
     paths["script"].chmod(0o644)  # e.g. an older, world-readable install
     alert.apply_alert(Runner(exec_fn=fake_exec), webhook="https://hooks.example/new")
     backup = paths["script"].with_name(paths["script"].name + ".bak")
     assert backup.is_file()
-    assert backup.stat().st_mode & 0o777 == 0o700
+    assert backup.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.parametrize(
@@ -95,7 +95,7 @@ def test_quote_or_control_chars_in_webhook_are_refused(
 def test_verify_fails_when_timer_inactive(
     fake_exec: Any, paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(alert, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(alert, "confirm_once", lambda plan: True)
     fake_exec.responses.append(("systemctl is-active lhm-alert.timer", 3, "inactive\n", ""))
     results = alert.apply_alert(Runner(exec_fn=fake_exec), webhook="https://hooks.example/x")
     assert results[-1].status is Status.FAIL
@@ -128,7 +128,7 @@ def test_verbose_install_hides_the_webhook_script(
 ) -> None:
     from lhm.core import colors
 
-    monkeypatch.setattr(alert, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(alert, "confirm_once", lambda plan: True)
     colors.configure("always", verbose=True)
     stream = io.StringIO()
     colors.set_output(stream)
@@ -146,7 +146,7 @@ def test_verbose_script_backup_hides_the_old_webhook(
 ) -> None:
     from lhm.core import colors
 
-    monkeypatch.setattr(alert, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(alert, "confirm_once", lambda plan: True)
     paths["script"].parent.mkdir(parents=True)
     paths["script"].write_text("WEBHOOK_URL='https://old.example/oldtok'\n", encoding="utf-8")
     colors.configure("always", verbose=True)

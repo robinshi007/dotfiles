@@ -41,7 +41,7 @@ def test_identical_file_with_immutable_rules_skips_load(
 def test_apply_loads_rules_and_verifies(
     fake_exec: Any, rules: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(audit, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(audit, "confirm_once", lambda plan: True)
     fake_exec.responses.append(("dpkg-query", 1, "", "not installed"))
     fake_exec.responses.append(("systemctl is-active auditd", 3, "inactive\n", ""))
     fake_exec.responses.append(("augenrules --load", 0, "", ""))
@@ -60,7 +60,7 @@ def test_load_failure_with_identical_file_is_a_warning(
 ) -> None:
     rules.parent.mkdir(parents=True)
     rules.write_text(audit.desired_rules(), encoding="utf-8")
-    monkeypatch.setattr(audit, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(audit, "confirm_once", lambda plan: True)
     # auditd not active -> load is attempted even though the file is current.
     fake_exec.responses.append(("dpkg-query", 0, "install ok installed", ""))
     fake_exec.responses.append(("systemctl is-active auditd", 3, "inactive\n", ""))
@@ -82,7 +82,7 @@ def test_load_failure_without_confirmed_immutability_fails(
     """Identical file but auditctl -s does not confirm enabled=2 -> FAIL."""
     rules.parent.mkdir(parents=True)
     rules.write_text(audit.desired_rules(), encoding="utf-8")
-    monkeypatch.setattr(audit, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(audit, "confirm_once", lambda plan: True)
     fake_exec.responses.append(("dpkg-query", 0, "install ok installed", ""))
     fake_exec.responses.append(("systemctl is-active auditd", 3, "inactive\n", ""))
     fake_exec.responses.append(("augenrules --load", 1, "", "Error - auditing already enabled\n"))
@@ -96,7 +96,7 @@ def test_load_failure_without_confirmed_immutability_fails(
 def test_load_failure_after_new_file_fails(
     fake_exec: Any, rules: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(audit, "confirm_twice", lambda plan: True)
+    monkeypatch.setattr(audit, "confirm_once", lambda plan: True)
     fake_exec.responses.append(("dpkg-query", 0, "install ok installed", ""))
     fake_exec.responses.append(("systemctl is-active auditd", 3, "inactive\n", ""))
     fake_exec.responses.append(("augenrules --load", 1, "", "syntax error\n"))

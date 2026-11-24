@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from lhm.core.checks import probe_service
-from lhm.core.confirm import confirm_twice
+from lhm.core.confirm import confirm_once
 from lhm.core.distro import AptBackend, DistroError
 from lhm.core.files import render_template, write_dropin
 from lhm.core.report import Status, StepResult
@@ -115,7 +115,7 @@ def apply_audit(runner: Runner) -> list[StepResult]:
             _verify(runner),
         ]
 
-    if not confirm_twice(plan):
+    if not confirm_once(plan):
         return [StepResult("audit", Status.ABORTED, "aborted; no changes made")]
 
     results = []
