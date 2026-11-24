@@ -84,6 +84,12 @@ trusted releases, never while a transaction is pending. LHM rechecks the
 worker's protocol, state format, and Python source fingerprint against that CLI
 before arming.
 
+Before redeploying either component, prevent new SSH transactions and verify
+as root that `/run/lhm-ssh-rollback/pending.json` is absent. If it exists or
+cannot be inspected, stop; never overwrite or delete the journal to proceed.
+Preserve the previous runtime separately in a root-controlled location before
+provisioning the matching replacement.
+
 ## Usage
 
 ```sh
@@ -220,6 +226,14 @@ factor. Verify the target port and key from the client. Keep the old
 session until confirmation succeeds. If the change is not confirmed within
 the window, systemd runs recovery even if the apply CLI was killed. This
 protection is **same-boot only**; do not reboot while confirmation is pending.
+
+If arming fails with `unexpected watchdog property: … WorkingDirectory`,
+affected versions of `systemd-run` omit the property when given
+`--working-directory=/` because `/` is the default. The fix sets
+`--property=WorkingDirectory=/` explicitly and still strictly verifies the
+property. Before retrying, deploy the CLI and worker from the same commit
+containing the fix, following the
+[safe replacement instructions](#provision-the-ssh-watchdog).
 
 After an attempted write of the new SSH drop-in, recovery must verify that the
 previous configuration is back in use, even if apply never issued a reload.

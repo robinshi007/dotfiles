@@ -410,7 +410,7 @@ def arm(runner: Runner, data: dict[str, object]) -> Pending:
                 "--property=Restart=no",
                 "--property=RestartSec=5s",
                 "--property=RestartForceExitStatus=75",
-                "--working-directory=/",
+                "--property=WorkingDirectory=/",
                 f"--setenv={_SERVICE_PATH}",
                 "--",
                 *worker,

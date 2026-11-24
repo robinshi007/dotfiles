@@ -55,7 +55,9 @@ def layout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return state
 
 
-def _systemd_properties(unit: str, interface: str, failure: str) -> dict[str, tuple[str, object]]:
+def _systemd_properties(
+    unit: str, interface: str, failure: str, *, working_directory: tuple[str, object]
+) -> dict[str, tuple[str, object]]:
     timer = unit == TIMER
     if interface == "Unit":
         return {
@@ -109,7 +111,7 @@ def _systemd_properties(unit: str, interface: str, failure: str) -> dict[str, tu
         "User": ("s", "nobody" if failure == "user" else "root"),
         "Group": ("s", "nogroup" if failure == "group" else "root"),
         "DynamicUser": ("b", False),
-        "WorkingDirectory": ("s", "/"),
+        "WorkingDirectory": working_directory,
         "RootDirectory": ("s", ""),
         "RootImage": ("s", ""),
         "Environment": ("as", ["PATH=/usr/sbin:/usr/bin:/sbin:/bin"]),
@@ -128,8 +130,17 @@ FakeRunner = Callable[..., Runner]
 
 @pytest.fixture
 def fake_runner(layout: Path) -> FakeRunner:
-    def make(*, fail: str = "", stop_rc: int = 0, dry_run: bool = False) -> Runner:
+    def make(
+        *,
+        fail: str = "",
+        stop_rc: int = 0,
+        dry_run: bool = False,
+        reported_directory: tuple[str, object] | None = None,
+    ) -> Runner:
+        effective_directory = ""
+
         def execute(cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+            nonlocal effective_directory
             assert 0 < timeout <= 10
             if cmd[0] == str(watchdog._PYTHON):
                 assert not layout.exists() or watchdog.current() is None
@@ -167,7 +178,15 @@ def fake_runner(layout: Path) -> FakeRunner:
                     "expire",
                     TXID,
                 ]
-                assert cmd[cmd.index("--") + 1] == str(watchdog._PYTHON)
+                separator = cmd.index("--")
+                assert cmd[separator + 1] == str(watchdog._PYTHON)
+                for arg in cmd[1:separator]:
+                    option, _, value = arg.partition("=")
+                    if option == "--working-directory":
+                        # systemd-run v255 suppresses root for this CLI option.
+                        effective_directory = "" if value == "/" else value
+                    elif arg.startswith("--property=WorkingDirectory="):
+                        effective_directory = value.removeprefix("WorkingDirectory=")
                 return subprocess.CompletedProcess(cmd, 124 if fail == "schedule" else 0, "", "")
             if cmd[0] == "/usr/bin/busctl":
                 assert "--json=short" in cmd
@@ -178,7 +197,12 @@ def fake_runner(layout: Path) -> FakeRunner:
                 assert path in {base + "timer", base + "service"}
                 unit = TIMER if path == base + "timer" else SERVICE
                 assert interface.startswith("org.freedesktop.systemd1.")
-                properties = _systemd_properties(unit, interface.rsplit(".", 1)[-1], fail)
+                properties = _systemd_properties(
+                    unit,
+                    interface.rsplit(".", 1)[-1],
+                    fail,
+                    working_directory=reported_directory or ("s", effective_directory),
+                )
                 rows = (
                     dict(zip(("type", "data"), properties[name], strict=True)) for name in names
                 )
@@ -248,6 +272,20 @@ def test_watchdog_round_trip(layout: Path, fake_runner: FakeRunner) -> None:
 def test_unverified_timer_is_inert(fake_runner: FakeRunner, failure: str) -> None:
     runner = fake_runner(fail=failure, stop_rc=1)
     with pytest.raises(watchdog.WatchdogError):
+        watchdog.arm(runner, {"attempted": []})
+    assert watchdog.current() is None
+    assert runner.history[-1].cmd[-2:] == ["stop", TIMER]
+
+
+@pytest.mark.parametrize(
+    "reported_directory", [("s", ""), ("s", "/tmp"), ("o", "/")], ids=["empty", "nonroot", "type"]
+)
+@pytest.mark.parametrize("stop_rc", [0, 1], ids=["stopped", "stop-failed"])
+def test_unverified_working_directory_invalidates_marker(
+    fake_runner: FakeRunner, reported_directory: tuple[str, object], stop_rc: int
+) -> None:
+    runner = fake_runner(reported_directory=reported_directory, stop_rc=stop_rc)
+    with pytest.raises(watchdog.WatchdogError, match=r" WorkingDirectory$"):
         watchdog.arm(runner, {"attempted": []})
     assert watchdog.current() is None
     assert runner.history[-1].cmd[-2:] == ["stop", TIMER]
