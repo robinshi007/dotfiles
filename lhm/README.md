@@ -28,6 +28,10 @@ Safety-first design:
   prints `(content hidden: contains a secret)` instead of the alert script (the
   `.bak` copy and its diff are suppressed too).
 
+The repository's root `.gitignore` ignores untracked files under `secrets/`
+directories at any depth. It does not protect already-tracked secrets or remove
+them from Git history.
+
 ## Install
 
 ```sh
@@ -52,28 +56,33 @@ not group- or world-writable, and free of symlinks. The worker runs with
 `-I -S -B` and imports lhm from this dedicated root-controlled copy, not from
 your checkout, venv, user site, or uv runtime.
 
-For a fresh deployment, stage a verified, relocatable CPython 3.15 install
-image for the host and the matching trusted lhm release source in root-controlled
-directories. Copy and dereference **only** those artifacts after verifying that
-their symlink targets are also trusted. The Python image must contain both
-`bin/python3.15` and its prefix-local standard library; do not copy a venv.
+For a **first install**, start in `lhm/` in a trusted release checkout and run
+these commands as an unprivileged user:
 
 ```sh
-watchdog=/opt/lhm-ssh-rollback
-python_image=/path/to/trusted/cpython-3.15-install-image
-lhm_release=/path/to/trusted/lhm-release
-sudo install -d -m 0700 "$watchdog"
-sudo install -d -m 0755 "$watchdog/python" "$watchdog/src"
-sudo cp -RL -- "$python_image/." "$watchdog/python/"
-sudo cp -RL -- "$lhm_release/src/lhm" "$watchdog/src/"
-sudo find "$watchdog/src/lhm" -type f -name '*.pyc' -delete
-sudo chown -R root:root -- "$watchdog"
-sudo chmod -R go-w -- "$watchdog"
+uv sync --locked --managed-python --python 3.15
+./scripts/install-ssh-watchdog.sh
 ```
 
-On upgrade, replace the worker and CLI with matching releases, never while
-a transaction is pending. LHM compares the isolated worker's protocol, state
-format and Python source fingerprint with the CLI before arming.
+The script shows the selected CPython image and Git commit, then asks for one
+exact `y` before using sudo. `--dry-run` shows that plan without sudo or touching
+`/opt`; it still runs uv for discovery. The script copies the full CPython base
+installation (not the venv) and only committed lhm sources from the selected
+commit. Before confirming, verify the release, the relocatable CPython 3.15
+image, and **all** symlink targets in that image: they are copied and used as
+root. The CLI source fingerprint checks that the staged worker matches the
+CLI, not that Python comes from a trusted source. Do not modify those inputs or
+start an SSH transaction during installation.
+
+The installer refuses a pending transaction or an existing destination,
+including dangling symlinks. It publishes only after the isolated worker probes
+successfully. Publication requires Linux `renameat2(RENAME_NOREPLACE)` support
+on the `/opt` filesystem; there is no fallback that can overwrite a destination.
+The installer does not change SSH configuration or start services. It is not an
+upgrade command: replace the worker and root-controlled CLI only with matching
+trusted releases, never while a transaction is pending. LHM rechecks the
+worker's protocol, state format, and Python source fingerprint against that CLI
+before arming.
 
 ## Usage
 
