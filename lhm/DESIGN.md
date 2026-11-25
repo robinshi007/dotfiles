@@ -1,7 +1,11 @@
 # lhm — Linux Hardening & Management CLI
 
-Status: design confirmed 2026-11-22. Python >= 3.15, stdlib only (argparse, subprocess,
+Status: design confirmed 2026-11-22. Python 3.15.x, stdlib only (argparse, subprocess,
 pathlib, shutil, string.Template, json, hashlib, urllib.request). Dev dep: pytest via uv.
+
+The package requires `==3.15.*`; `.python-version` selects the 3.15 minor
+without pinning a patch. `uv.lock` records the dependency resolution, not the
+interpreter patch.
 
 ## Scope
 

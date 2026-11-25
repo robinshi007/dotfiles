@@ -16,7 +16,7 @@ ENV container=docker \
 # uv binary from the official image (no host file copied into the build context).
 COPY --from=ghcr.io/astral-sh/uv:0.13.7 /uv /usr/local/bin/uv
 
-# Ubuntu 24.04 ships Python 3.12; lhm needs >= 3.15, which `uv sync --python 3.15`
+# Ubuntu 24.04 ships Python 3.12; lhm needs 3.15.x, which `uv sync --python 3.15`
 # downloads as a managed CPython into /opt/uv-python at build time.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \

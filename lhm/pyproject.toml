@@ -2,7 +2,7 @@
 name = "lhm"
 version = "0.1.0"
 description = "Linux hardening and management CLI for Debian/Ubuntu"
-requires-python = ">=3.15"
+requires-python = "==3.15.*"
 dependencies = []
 
 [project.scripts]

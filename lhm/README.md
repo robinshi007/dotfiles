@@ -1,6 +1,6 @@
 # lhm — Linux Hardening & Management CLI
 
-A single-binary, stdlib-only (Python >= 3.15) command line tool to query and harden
+A single-binary, stdlib-only (Python 3.15.x) command line tool to query and harden
 Debian 12 / Ubuntu 22.04+ servers: system updates, SSH hardening, firewall,
 fail2ban, sysctl/service sandboxing, audit, logging, alerting and backups.
 
@@ -36,11 +36,18 @@ them from Git history.
 
 ## Install
 
+`.python-version` tells uv to select Python 3.15 without pinning a patch
+release; the package requires `==3.15.*`.
+
 ```sh
 cd lhm/
-uv sync                 # or: uv tool install .  (requires uv, Python 3.15 managed automatically)
-uv run lhm --help
+uv sync --locked        # or: uv tool install .
+uv run --locked lhm --help
 ```
+
+`--locked` checks that `uv.lock` is up to date without rewriting it. Add
+`--offline` to sync or run without network access once a compatible interpreter
+is installed and the required packages are cached.
 
 Root is required for live `apply`, `ssh-confirm`, `ssh-recover`, and `rollback`;
 `query`/`check` work unprivileged. For root commands below, `/opt/lhm/bin/lhm` is
@@ -583,8 +590,8 @@ lhm query ssh --color=never
 ## Testing
 
 ```sh
-uv run pytest -q          # unit tests; host-management commands are faked
-uv run ruff check
+uv run --locked pytest -q  # unit tests; host-management commands are faked
+uv run --locked ruff check
 cd integration && sudo ./run.sh   # docker-based integration suite (9 scenarios)
 ```
 

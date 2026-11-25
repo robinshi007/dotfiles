@@ -24,7 +24,9 @@ scenario was skipped (environment limitation, see below). Each scenario runs in
 a **fresh** container, so state never leaks between them.
 
 Requirements in the VM: Docker and root or `sudo`. The image build downloads
-a managed CPython 3.15 via `uv` (~40 MB) and takes a few minutes on a cold cache.
+a managed CPython 3.15.x via `uv` (~40 MB) and takes a few minutes on a cold
+cache. Like `.python-version` in the checkout, `--python 3.15` selects the
+minor, not a patch; the package requires `==3.15.*`.
 
 ## Image
 
@@ -38,9 +40,11 @@ a managed CPython 3.15 via `uv` (~40 MB) and takes a few minutes on a cold cache
   `nftables` is explicit because it is only a *Recommends* of fail2ban while
   the shipped `jail.d/99-lhm.local` uses `banaction = nftables-multiport`.
   The image also installs sudo for the real SSH confirmation scenarios.
-* `uv sync --python 3.15` installs lhm into `/opt/lhm-venv`, with
-  `/usr/local/bin/lhm` symlinked to it. The project is copied at build time, so
-  rebuild after changing `src/`.
+* `uv sync --frozen --managed-python --python 3.15 --no-dev` installs lhm into
+  `/opt/lhm-venv`, with `/usr/local/bin/lhm` symlinked to it. `--frozen` uses
+  the copied `uv.lock` without checking whether it is up to date; it does not
+  make the build offline. The project is copied at build time, so rebuild
+  after changing `src/`.
 * The image copies the full uv-managed CPython prefix (including the standard
   library) to `/opt/lhm-ssh-rollback/python`, and the same lhm source to
   `/opt/lhm-ssh-rollback/src/lhm`. Both trees are root-owned, symlink-free, and
