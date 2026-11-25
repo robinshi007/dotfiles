@@ -1,11 +1,12 @@
 """Read and update SSH user files without giving their paths root authority."""
 
 import base64
+import errno
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from lhm.core.runner import CommandResult, Runner
+from lhm.core.runner import DEFAULT_TIMEOUT, CommandResult, Runner
 
 _MAX_BYTES = 1024 * 1024
 _MAX_KEY_BYTES = 16 * 1024
@@ -53,25 +54,34 @@ class KeyState:
 
 
 def _run(
-    runner: Runner, argv: list[str], operation: str, *, redact: frozenset[int] = frozenset()
+    runner: Runner,
+    argv: list[str],
+    operation: str,
+    *,
+    redact: frozenset[int] = frozenset(),
+    timeout: float = DEFAULT_TIMEOUT,
 ) -> CommandResult:
     # Do not leak potentially account-controlled command output on errors.
     try:
-        return runner.run(argv, check=False, redact=redact, preserve_newlines=True)
-    except (
-        OSError,
-        ValueError,
-    ):
+        return runner.run(argv, check=False, redact=redact, preserve_newlines=True, timeout=timeout)
+    except OSError as exc:
+        raise UserKeysError(f"{operation} could not execute") from exc
+    except ValueError:
         raise UserKeysError(f"{operation} could not execute") from None
 
 
-def lookup_account(runner: Runner, name: str) -> Account | None:
+def lookup_account(
+    runner: Runner, name: str, *, timeout: float = DEFAULT_TIMEOUT
+) -> Account | None:
     """Resolve one exact getent passwd name; only exit status 2 means absent."""
     if not _NAME.fullmatch(name):
         raise UserKeysError("invalid account name")
-    result = _run(runner, ["/usr/bin/getent", "passwd", name], "account lookup")
+    result = _run(runner, ["/usr/bin/getent", "passwd", name], "account lookup", timeout=timeout)
     if result.returncode == 2:
         return None
+    if result.returncode == 124:
+        timeout = TimeoutError(errno.ETIMEDOUT, "account lookup timed out")
+        raise UserKeysError("account lookup failed (rc=124)") from timeout
     if not result.ok:
         raise UserKeysError(f"account lookup failed (rc={result.returncode})")
     record = result.stdout.removesuffix("\n")
@@ -391,6 +401,7 @@ def ensure_key(runner: Runner, account: Account, key_line: str) -> bool:
     Accepts an already validated line without surrounding spaces or tabs.
     Existing lines match after stripping SSH-file whitespace. Modes tighten to 0700/0600
     only; a mode missing any needed owner bit is refused, not widened.
+    The SSH module holds its transaction lock and refuses a pending watchdog before calling.
     """
     if (
         not key_line

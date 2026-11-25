@@ -113,7 +113,16 @@ def watchdog(monkeypatch: pytest.MonkeyPatch) -> WatchdogFake:
 def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     monkeypatch.delenv("SSH_CONNECTION", raising=False)
     root = tmp_path / "home"
-    root.mkdir()
+    root.mkdir(mode=0o700)
+    # This suite's synthetic login accounts have no matching local UID/GID.
+    # Exercise permission targeting separately against real temporary inodes.
+    monkeypatch.setattr(
+        ssh,
+        "_permission_account",
+        lambda runner, name, *, dry_run: ssh.userkeys.Account(
+            "fixture", os.getuid() or 1, os.getgid() or 1, root
+        ),
+    )
     monkeypatch.setattr(ssh, "HOME_ROOT", root)
     dropin = tmp_path / "etc" / "ssh" / "sshd_config.d" / "99-lhm.conf"
     dropin.parent.mkdir(mode=0o755, parents=True)
@@ -986,12 +995,51 @@ def test_hardening_writes_dropin_then_reloads_and_verifies(
     assert "not a login test" in results[-1].detail
 
 
+@pytest.mark.parametrize(
+    "prior",
+    [
+        pytest.param(None, id="current"),
+        pytest.param(
+            """# ===== lhm ssh hardening drop-in =====
+# Managed by lhm. Remove this file to revert. sshd_config.d drop-ins take
+# precedence over the main sshd_config (first obtained value wins).
+# Supported OpenSSH versions only use SSHv2; this legacy directive is ignored.
+Protocol 2
+Port 22345
+PermitRootLogin no
+PasswordAuthentication no
+PermitEmptyPasswords no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+# Use one explicit path so the effective-config probe can verify it unambiguously.
+AuthorizedKeysFile .ssh/authorized_keys
+AuthenticationMethods publickey
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+MaxAuthTries 3
+MaxStartups 3:50:10
+MaxSessions 4
+ClientAliveInterval 300
+ClientAliveCountMax 2
+LoginGraceTime 30
+AllowUsers old
+""",
+            id="with-deprecated-alias",
+        ),
+    ],
+)
 def test_hardening_adds_requested_user_without_removing_managed_user(
-    fake_exec: Any, home: Path, monkeypatch: pytest.MonkeyPatch, watchdog: WatchdogFake
+    fake_exec: Any,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    watchdog: WatchdogFake,
+    prior: str | None,
 ) -> None:
     monkeypatch.setattr(ssh, "confirm_once", lambda plan: True)
     port = 22345
-    ssh.SSHD_DROPIN.write_text(ssh.desired_conf(port, ["old"]), encoding="utf-8")
+    ssh.SSHD_DROPIN.write_text(prior or ssh.desired_conf(port, ["old"]), encoding="utf-8")
     for name in ("old", "ops"):
         seed_user(home, name)
     fake_exec.responses.extend(

@@ -1,8 +1,7 @@
-"""Apply modules, in DESIGN.md execution order.
+"""Apply modules, with the default modules in DESIGN.md execution order.
 
-All eleven modules are implemented; the registry order is the ``apply all``
-order. ``services`` (``apply cleanup-services``) is interactive, so
-``apply all`` deliberately skips it.
+``services`` (``apply cleanup-services``) is interactive, so ``apply all``
+deliberately skips it. Caddy is resolved only for an explicit ``apply caddy``.
 """
 
 from dataclasses import dataclass
@@ -58,6 +57,10 @@ APPLY_ALL_ORDER: tuple[str, ...] = tuple(
 
 
 def resolve(name: str) -> Module | None:
+    if name == "caddy":
+        from lhm.modules.caddy import CaddyModule
+
+        return CaddyModule()
     for module in MODULES:
         if module.name == name:
             return module

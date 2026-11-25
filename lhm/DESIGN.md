@@ -13,27 +13,43 @@ pathlib, shutil, string.Template, json, hashlib, urllib.request). Dev dep: pytes
 ## CLI
 
 ```
-lhm query system|ssh|firewall|fail2ban|services|ports|sysctl|audit|updates [--json]
-lhm check                                    # idempotency audit: OK / needs-change
+lhm query system [--public-ip] [--json]
+lhm query ssh|firewall|fail2ban|services|ports|sysctl|audit|updates|caddy|all [--json]
+lhm check                                    # OK / needs-change / UNKNOWN; cleanup is manual
 lhm apply updates [--security-only]
 lhm apply ssh-user NAME --key FILE [--sudo]
-lhm apply ssh-hardening [--port 22345] [--allow-user NAME]...
+lhm apply ssh-hardening [--port 22345] [--ssh-user NAME] [--allow-user NAME]...
 lhm ssh-confirm ID                           # accept a pending live SSH change
 lhm ssh-recover ID                           # retry recovery of a failed SSH transaction
 lhm apply firewall [--allow PORT/PROTO]...   # 22345/tcp pre-allowed by default
-lhm apply fail2ban [--bantime 8h --findtime 30m --maxretry 3] [--caddy]
+lhm apply fail2ban [--bantime 8h] [--findtime 30m] [--maxretry 3] [--caddy-maxretry 5]
+                  [--caddy | --caddy-direct --caddy-protected-path PATH ... | --caddy-revoke-direct]
+lhm apply caddy --site HOSTNAME --upstream LOOPBACK:PORT
 lhm apply cleanup-services                   # interactive per-item selection
 lhm apply sysctl
 lhm apply sandbox [SERVICE]...               # fixed whitelist only
 lhm apply audit | logging | alert --webhook URL | backup --target PATH
-lhm apply all --webhook URL --target PATH [--ssh-user NAME --key FILE]
-                                             # ordered 1..6, no ssh-hardening or cleanup-services
+lhm apply all --webhook URL --target PATH [--ssh-user NAME --key FILE] [--security-only] [--caddy]
+                                              # no ssh-hardening, cleanup-services or Caddy setup
 lhm rollback FILE                            # restore newest .bak[.N]
 
-Global: --dry-run  --json  --verbose.  No --yes flag: changed modules need
+Global: --dry-run  --json  --verbose  --color auto|always|never.
+No --yes flag: changed modules need
 one confirmation each; non-TTY write runs fail closed unless the operation supports
 the environment bypass and it is enabled.
 ```
+
+`query system` reads local network and clock state; it does not perform an
+external IP lookup unless `--public-ip` is passed to that target. The opt-in
+requests disclose egress addresses to the HTTPS lookup service and are
+incompatible with dry-run. Neither `query all` nor `check` uses the lookup.
+`query all` includes the read-only Caddy status; `apply all` does not deploy
+Caddy. `query caddy` reports disk and systemd state, not verified live routing.
+`query firewall` reports UFW-visible rules separately from Caddy auto-ingress
+eligibility, and `query fail2ban` separates configured Caddy mode from live
+jail status. These reports are not reachability or ban tests. Query success
+means a report was produced even if probes were unavailable. `check` exits 1
+for `UNKNOWN`, not for `needs-change` alone.
 
 ## Execution model
 
@@ -47,8 +63,8 @@ For `apply cleanup-services`, selecting units is input to the plan, not confirma
 `LHM_CONFIRM_BYPASS=1` (env, exact value `1`) skips the single confirmation prompt
 where supported for unattended root runs and the integration suite
 (`lhm/integration/`). It is not a CLI flag and never bypasses the idempotency
-check or the dry-run guarantee. `ssh-confirm`, `ssh-recover`, and
-`apply cleanup-services` do not honor it.
+check or the dry-run guarantee. `ssh-confirm`, `ssh-recover`,
+`apply cleanup-services` and SSH chmod plans do not honor it.
 
 ## Safety rules
 
@@ -56,7 +72,8 @@ check or the dry-run guarantee. `ssh-confirm`, `ssh-recover`, and
    `f.bak`, `f.bak.1`, `f.bak.2`… without overwriting existing backups.
    `rollback` uses the newest number and atomically replaces the target.
    The CLI accepts only exact managed system-file paths, not aliases or
-   symlinks. Restore `authorized_keys` manually as the account owner.
+   symlinks. Restore `authorized_keys` manually as the account owner. Caddy
+   and fail2ban configuration require lifecycle-aware reapply, not file rollback.
 2. Appends to existing files use marked blocks. Repeated runs compare the body;
    changed content replaces only that block after a backup. Malformed blocks
    are rejected without a write:
@@ -69,8 +86,8 @@ check or the dry-run guarantee. `ssh-confirm`, `ssh-recover`, and
    silently ignore tail appends): `/etc/ssh/sshd_config.d/99-lhm.conf`,
    `/etc/sysctl.d/99-lhm.conf`, `/etc/systemd/system/<svc>.service.d/99-lhm-sandbox.conf`,
    `/etc/audit/rules.d/99-lhm.rules`, `/etc/fail2ban/jail.d/99-lhm.local`,
-   `/etc/apt/apt.conf.d/51-lhm`. Creating a new drop-in is NOT a "modify existing
-   file" op: no .bak needed; overwrite is idempotent (same content => skip).
+   `/etc/systemd/system/apt-daily-upgrade.service.d/51-lhm.conf`.
+   Creating a new drop-in needs no `.bak`; identical content needs no rewrite.
 4. SSH anti-lockout order (apply ssh-user -> ssh-hardening): create user, install
    authorized_keys (0700/0600, validate pubkey format first) -> only then write
    drop-in `PermitRootLogin no, PasswordAuthentication no,
@@ -109,13 +126,25 @@ check or the dry-run guarantee. `ssh-confirm`, `ssh-recover`, and
    transaction is pending, refuse a new SSH hardening apply and manual rollback
    of the managed drop-in. The lock does not coordinate out-of-band changes:
    operators must not run `apply firewall` or `apply sandbox` concurrently.
-   The `sshd -T` gate also covers `AllowUsers`: a non-empty effective value must
-   contain every admin user that has an authorized key, otherwise reloading would
-   lock them out (an empty value means everyone may log in).
+   The `sshd -T` gate also checks that a non-empty effective `AllowUsers`
+   includes all the selected administrators. Existing managed names are
+   retained, `--allow-user` appends names, and initial discovery runs only
+   when there is no managed drop-in and no explicit list. Other OpenSSH
+   allowlist directives are not rewritten.
+
+   `--ssh-user` chooses the existing non-root NSS account whose `.ssh` and
+   `authorized_keys` modes are tightened to 0700/0600, independently of
+   `--allow-user`. Root without a verified non-root sudo invoker must pass
+   `--ssh-user NAME`, even for drop-in-only hardening. No missing paths are
+   created. A mode change may only remove permission bits. Refuse symlinks,
+   incorrect ownership, unsafe write or special bits and multiply linked
+   `authorized_keys`. For direct root key imports, the source file and its
+   parent directories must be root-owned, symlink-free and not writable by
+   group or others.
 
    For a changed live `apply ssh-hardening`, obtain one confirmation first, then
-   arm and verify a 10-minute systemd timer before changing SSH and print the
-   transaction ID. Timer setup failure or unknown timer state fails closed.
+   arm and verify a 10-minute systemd timer before any drop-in or mode change
+   and print the transaction ID. Timer setup failure or unknown state fails closed.
    The timer is independent of the CLI and starts recovery if the transaction
    is still unconfirmed at expiry, even after the CLI is killed. Its scope is
    the current boot only. PID 1 schedules transient
@@ -124,6 +153,22 @@ check or the dry-run guarantee. `ssh-confirm`, `ssh-recover`, and
    `/run/dbus/system_bus_socket`. The volatile transaction journal is
    `/run/lhm-ssh-rollback/pending.json` (root-only, `0700` directory and `0600`
    file).
+
+   Journal the account, durable inode identities (including `statx` birth time)
+   and original modes, plus intent and completion evidence for each chmod.
+   A chmod plan requires a verified foreground Linux console (not a PTY),
+   `rescue.target` or `emergency.target` active and `multi-user.target`
+   confirmed inactive. The operator must quiesce external key writers and
+   keep that console available. The console and unit state are checked before
+   confirmation and again before chmod; confirmation bypass is disabled.
+   Permission-only transactions do not reload sshd, but still require a fresh
+   login and `ssh-confirm`. Recovery never chmods or widens permissions. After a
+   journaled chmod attempt, automatic recovery can restore sshd but retains the
+   failed marker and reports the targets for manual review. On an independent
+   Linux console, the operator can restore the recorded original modes of
+   attempted inodes after verifying identity and safety; `ssh-recover`
+   verifies the modes and finishes rollback without chmod.
+   Do not modify replacements or unattempted targets.
 
    The worker invokes `/opt/lhm-ssh-rollback/python/bin/python3.15` with
    `-I -S -B`. It requires standalone CPython 3.15 with its own prefix-local
@@ -134,8 +179,10 @@ check or the dry-run guarantee. `ssh-confirm`, `ssh-recover`, and
    the caller's checkout, project venv, and uv runtime. Path checks protect
    the installed copy, not its provenance: provision only from trusted artifacts
    (see [README](README.md#provision-the-ssh-watchdog)).
+   Arming requires matching protocol, schema and source fingerprint. The
+   permissions-aware worker uses protocol 4; the journal schema remains v1.
 
-   Keep the old SSH session open and have local or out-of-band console access.
+   Have local or out-of-band console access and keep any old SSH session open.
    From a second, non-multiplexed real key login on the target port as an
    approved administrator, run
    `sudo env SSH_CONNECTION="$SSH_CONNECTION" /opt/lhm/bin/lhm ssh-confirm ID`
@@ -151,12 +198,16 @@ check or the dry-run guarantee. `ssh-confirm`, `ssh-recover`, and
    `sshd -T`), allow every current SSH port AND 22345/tcp BEFORE
    `default deny incoming` + `enable`. A server still on port 22 (or `apply all`
    with only ssh-user done) must keep its current port open. When no listener can
-   be probed AND no `--allow` was given, FAIL closed before running any `ufw`
-   command (default deny would lock the host out); `--allow PORT/PROTO` is the
-    explicit escape hatch when no listener is detected and socket state is
-    known. An unknown SSH socket state or incomplete live socket evidence
-    blocks UFW changes even with `--allow`. Only `ALLOW`/`ALLOW IN` rules satisfy the inbound
-   check: `ALLOW FWD` is a forward rule and must not read as "port allowed".
+   be probed, an explicit `--allow PORT/PROTO` is accepted only if neither
+   socket is active and the standalone `sshd -T` fallback succeeds without
+   any `Port` entries. Unknown socket state, incomplete active-socket
+   evidence or a failed or invalid fallback blocks UFW even with `--allow`.
+   Only `ALLOW`/`ALLOW IN` rules satisfy the inbound check: `ALLOW FWD` is not
+   an inbound rule. Check IPv6 capability locally, not from routes or globally
+   scoped addresses. Unknown capability or unknown UFW IPv6 settings block
+   live apply, as does any mismatch between them. For enabled IPv6, verify
+   inbound coverage for both address families. If active UFW defaults differ
+   from the target, fail rather than restart UFW to change the defaults.
 6. Verify after every module (sshd -T grep, ss -tlnp listening port, ufw status
    verbose, sysctl spot checks, systemd-analyze security, augenrules --check,
    fail2ban-client status, plus `fail2ban-client get sshd bantime` and
@@ -172,8 +223,9 @@ check or the dry-run guarantee. `ssh-confirm`, `ssh-recover`, and
    ProtectHome=read-only keeps `/home/*/.ssh/authorized_keys` readable.
    Automatic recovery is per-module and deliberately narrow — lhm only undoes
    changes it made in this run, never global host state: ssh attempts to restore
-   its prior drop-in and listener; sandbox rolls its drop-in back; **firewall never
-   disables a firewall that was already active** (no automatic `ufw disable`, the
+   its prior drop-in and listener, never chmods; sandbox rolls its drop-in
+   back; **firewall never disables a firewall that was already active**
+   (no automatic `ufw disable`, the
    hint is conditional/manual) and **audit never rewrites/replaces pre-existing
     audit rules after a live verification failure** (a load failure can leave
     `99-lhm.rules` on disk; use the manual rollback hint). A failed run may be
@@ -224,28 +276,96 @@ check or the dry-run guarantee. `ssh-confirm`, `ssh-recover`, and
    and, unless the bypass is set, one prompt on a TTY. It backs up the current
    file first (a rollback can itself be rolled back).
 
-## Modules (apply order = table order)
+## Modules (`apply all` order, grouped)
 
 | # | module | summary |
 |---|--------|---------|
-| 1 | updates | apt update && upgrade (security-only option); install unattended-upgrades; template to apt.conf.d (security-only autoinstall) |
-| 2 | ssh | useradd + sudo group; authorized_keys; sshd drop-in incl Port 22345; sshd -t gate |
-| 3 | firewall | ufw allow 22345/tcp first, default deny incoming / allow outgoing, enable |
-| 4 | fail2ban | apt install fail2ban + nftables (nftables is only a Recommends of fail2ban; without it bans silently fail); `jail.d/99-lhm.local` drop-in (sshd jail port 22345, backend systemd, mode aggressive, maxretry 3, findtime 30m, bantime 8h with bantime.increment/factor 3/maxtime 4w/rndtime 30m); optional caddy jail (`--caddy`) with the lhm-provided `filter.d/caddy-lhm.conf`; `/etc/fail2ban/jail.local` is never written (it holds the host's own jails and the drop-in wins by load order); cleanup-services: ss -tulpn + enabled units, per-item interactive selection |
+| 1 | updates | refresh APT and upgrade (`--security-only` uses a verified isolated security view); configure the independent security worker for `apt-daily-upgrade` |
+| 2 | ssh | optional `ssh-user` provisioning; `ssh-hardening` is standalone |
+| 3 | firewall | allow 22345/tcp and current SSH ports first, default deny incoming / allow outgoing, enable |
+| 4 | fail2ban | apt install fail2ban + nftables; `jail.d/99-lhm.local` drop-in (sshd port 22345, systemd backend, aggressive mode, maxretry 3, findtime 30m, incremental bantime starting at 8h); optional Caddy jail; never edit `jail.local` |
 | 5 | sysctl+sandbox | sysctl.d template (rp_filter, no icmp redirects accept, kptr_restrict=2, dmesg_restrict, unprivileged_bpf_disabled); sandbox drop-ins for fixed whitelist only (sshd, nginx, fail2ban) with per-service exceptions |
-| 6 | audit/log/alert/backup | auditd + rules.d template + augenrules; journald persistent + logrotate template; alert = systemd timer + script scanning journalctl -p err / fail2ban bans since last run, webhook via urllib, state file; backup = timer + tar template (/etc /home), sha256 manifest, keep N rotate, local dir target |
+| 6 | logging/audit/alert/backup | journald persistent + logrotate template; auditd + rules.d template + augenrules; alert = systemd timer + script scanning journalctl -p err / fail2ban bans since last run, webhook via urllib, state file; backup = timer + tar template (/etc /home), sha256 manifest, keep N rotate, local dir target |
 
-fail2ban load order is `jail.conf` → `jail.d/*.conf` → `jail.local` →
+**Updates:** The APT security check uses the OS codename, native architecture,
+distro archive keyring and signed Release metadata. The keyring package is
+`debian-archive-keyring` on Debian and `ubuntu-keyring` on Ubuntu. For a managed
+source, Debian uses its security archive; Ubuntu uses its security archive or
+Ubuntu Ports depending on architecture.
+Refuse unsafe source options, failed refreshes and missing or unverified native
+indexes. Live apply may add `lhm-security.sources` only when a security source
+is absent and it can derive components from a distro-keyring-scoped base source.
+The scheduled worker requires an existing scoped source and does not create one.
+A missing trust anchor is not bootstrapped.
+
+Normal apply uses the host's APT view for its upgrade. Manual `--security-only`
+and scheduled upgrades use `apt-get` with a freshly verified, isolated
+security-only view, not `unattended-upgrade`. Bootstrap installation of missing
+packages uses a separate distro base plus security view. In security-only mode
+its dpkg pre-install hook refuses a locked action plan that would change an
+existing package. Fail closed on local unattended blacklists, whitelists or APT
+pinning instead of dropping administrator exclusions. Config rollback does not
+roll back package changes.
+
+Provision the automatic worker first with `scripts/install-apt-security.sh`
+from a trusted, reviewed, committed `HEAD`; follow the
+[installer steps](README.md#provision-the-apt-security-worker) to verify the
+commit and managed CPython image. The first-install script probes a private
+root-controlled runtime with committed sources and templates, then publishes
+`/usr/local/libexec/lhm-apt-security` without replacing an existing launcher.
+Installation does not change APT or systemd timers. `apply updates` requires a
+matching helper and an already enabled, active `apt-daily-upgrade.timer`
+triggering `apt-daily-upgrade.service`. Replace only verified stock commands:
+`apt-daily` refreshes indexes only, and `apt-daily-upgrade` invokes the helper.
+Conflicting local commands or managed drop-ins are refused. Query and check
+inspect existing indexes and policy without refreshing or upgrading;
+unprivileged inspection may leave the private scheduled policy unverified.
+
+Runtime validation of Debian/Ubuntu release, architecture and archive trust
+is not a VM test matrix. The Ubuntu 24.04 container updates scenario tests
+dry-run planning, not a live transaction or scheduled execution.
+
+**Caddy:** Start the loopback backend and deploy with explicit
+`apply caddy --site HOSTNAME --upstream LOOPBACK:PORT`, which never changes UFW.
+The Caddyfile pairs one DNS hostname with a loopback upstream and redirects
+that site's HTTP requests to HTTPS on the same hostname. Then use a separate
+confirmed `apply firewall` run for `80/tcp` and `443/tcp`; these rules are
+automatic only with verified routing and listeners on an active, enabled,
+LHM-managed instance. Dry-run does not perform that live probe. The Caddy plan
+does not open UDP or upstream ports or remove old rules automatically. Public
+access requires DNS pointing to a reachable IP.
+Install the distro package with its default service held, refuse unmanaged
+config takeover, validate as the service user, and attempt to restore the
+previous config if activation fails. A failed loopback backend check can
+leave Caddy active. A service status check does not verify public DNS, TLS or
+reachability; verify the redirect and HTTPS externally.
+
+**Fail2ban:** Load order is `jail.conf` → `jail.d/*.conf` → `jail.local` →
 `jail.d/*.local`, so the lhm drop-in overrides a hand-maintained `jail.local`
-without touching it. `bantime.increment` needs the dbfile (Debian/Ubuntu default
-`/var/lib/fail2ban/fail2ban.sqlite3`, enabled by packaging); the increment
-formula is `bantime * (1 << banCount) * bantime.factor` up to `bantime.maxtime`,
-so bantime 8h / factor 3 gives 8h, 48h, 4d, 8d, 16d, then 4w. fail2ban ships no
-Caddy filter and 1.x has no JSON parsing, so `caddy-lhm` matches the raw JSON
-access log by regex (status 401/403/404/429, two patterns because JSON field
-order is not guaranteed) and needs Caddy's access log in journald (Caddy's
-default `log` output). The caddy jail is off by default: an enabled jail whose
-`caddy.service` is missing stops fail2ban from starting. Activation is
+without touching it. The SSH jail accepts `--bantime`, `--findtime` and
+`--maxretry`. `bantime.increment` needs the dbfile (Debian/Ubuntu default
+`/var/lib/fail2ban/fail2ban.sqlite3`, enabled by packaging). The drop-in uses
+factor 3, a calculation capped at 4 weeks and 30 minutes of randomization.
+
+The `caddy-lhm-access-*` file jail requires an explicit operator attestation
+(`apply fail2ban --caddy-direct` and repeatable `--caddy-protected-path PATH`),
+a readable JSON access log and a verified active managed Caddy config. LHM
+does not infer direct-client topology or configure authentication. The filter
+matches only an actual `401` on an exact listed path, excluding the query
+string, and takes the IP from the socket peer. `--caddy-maxretry` defaults to
+5 in both modes and must be at least 2 for the file jail. The file jail's
+nftables actions cover TCP 80/443 and UDP 443; they do not open UFW ports.
+
+Bind the path list to the running config fingerprint. A mismatch or unreadable
+runtime prevents new and restored bans. Reapplying fail2ban disables stale
+jail state, and applying changed Caddy config or starting inactive Caddy
+revokes the file jail. Before changing ingress topology, use
+`--caddy-revoke-direct`; re-attest after reconfiguration only if the topology
+and full protected path list are still valid. `--caddy` (also on `apply all`)
+selects the legacy journald mode (401/403/404/429), and is mutually exclusive
+with direct opt-in and revocation. Existing legacy jails are not migrated
+automatically. Do not take over external Caddy jails or filter overrides.
+Activation is
 `fail2ban-client reload --restart` when the daemon is already active (jails are
 restarted in place, the server and its bans stay up) and `enable --now` when it
 is not: a plain `systemctl reload` never re-runs the action's `actionstart`, and
@@ -255,8 +375,8 @@ then only reach the DB and the nftables table is never created.
 
 ## Templates
 
-`templates/*.tmpl` rendered via string.Template: fail2ban `99-lhm.local` +
-`caddy-filter.conf`, 99-lhm-sysctl.conf, sshd hardening, audit rules,
+`templates/*.tmpl` rendered via string.Template: fail2ban jail and filters,
+Caddyfile and install hold, 99-lhm-sysctl.conf, sshd hardening, audit rules,
 unattended-upgrades conf, journald, logrotate, alert/backup timer+service+script.
 
 ## Code layout
@@ -270,7 +390,7 @@ lhm/src/lhm/core/files.py     # marked-block append, drop-in write, template ren
 lhm/src/lhm/core/distro.py    # DistroBackend (apt impl)
 lhm/src/lhm/core/checks.py    # state probes (idempotency)
 lhm/src/lhm/core/report.py    # plan/verify tables, --json
-lhm/src/lhm/modules/*.py      # updates, ssh, firewall, fail2ban, services, sysctl, sandbox, logging, audit, alert, backup
+lhm/src/lhm/modules/*.py      # system, updates, ssh, firewall, fail2ban, caddy, services, sysctl, sandbox, logging, audit, alert, backup
 lhm/templates/*
 lhm/pyproject.toml            # uv, console script lhm, dev group pytest
 lhm/tests/*                   # host-management commands use a fake runner

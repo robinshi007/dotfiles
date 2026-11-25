@@ -258,21 +258,20 @@ def test_append_marked_creates_missing_file(tmp_path: Path) -> None:
 
 def test_render_template() -> None:
     rendered = render_template("unattended-upgrades.conf.tmpl")
-    assert "Unattended-Upgrade::Allowed-Origins" in rendered
+    assert "#clear Unattended-Upgrade::Allowed-Origins;" in rendered
+    assert "#clear Unattended-Upgrade::Origins-Pattern;" in rendered
     assert "APT::Periodic::Unattended-Upgrade \"1\";" in rendered
-    # string.Template escape: "$${distro_id}" renders as "${distro_id}".
-    assert '"${distro_id}:${distro_codename}-security"' in rendered
 
 
 def test_ssh_template_includes_hardening_defaults() -> None:
     settings = render_template(
         "ssh-hardening.conf.tmpl", port="22345", allow_users="admin"
     ).splitlines()
+    assert not any(line.startswith("ChallengeResponseAuthentication ") for line in settings)
     for line in (
         "Protocol 2",
         "MaxAuthTries 3",
         "PermitEmptyPasswords no",
-        "ChallengeResponseAuthentication no",
         "KbdInteractiveAuthentication no",
         "X11Forwarding no",
         "LoginGraceTime 30",

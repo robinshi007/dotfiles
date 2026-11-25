@@ -1,11 +1,22 @@
+import configparser
+import hashlib
+import json
+import os
+import re
+import socket
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from lhm.core import caddy_guard
+from lhm.core.files import locked_target
 from lhm.core.report import Status
 from lhm.core.runner import Runner
-from lhm.modules import fail2ban
+from lhm.modules import caddy, fail2ban
 
 JAIL_STATUS = """Status for the jail: sshd
 |- Filter
@@ -44,8 +55,14 @@ def filter_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Drop-in, filter, dbfile and the legacy jail.local under one tmp root."""
     root = tmp_path / "etc" / "fail2ban"
+    root.parent.mkdir(mode=0o755)
+    monkeypatch.setattr(caddy, "CADDYFILE", root.parent / "caddy" / "Caddyfile")
     monkeypatch.setattr(fail2ban, "JAIL_DROPIN", root / "jail.d" / "99-lhm.local")
     monkeypatch.setattr(fail2ban, "CADDY_FILTER", root / "filter.d" / "caddy-lhm.conf")
+    monkeypatch.setattr(
+        fail2ban, "CADDY_ACCESS_FILTER", root / "filter.d" / "caddy-lhm-access.conf"
+    )
+    monkeypatch.setattr(fail2ban, "CADDY_ACCESS_LOG", tmp_path / "log" / "access.log")
     monkeypatch.setattr(fail2ban, "LEGACY_JAIL_LOCAL", root / "jail.local")
     monkeypatch.setattr(fail2ban, "DBFILE", tmp_path / "lib" / "fail2ban.sqlite3")
     return root
@@ -58,7 +75,7 @@ def _fake_tools(fake_exec: Any, *, active: bool = True) -> None:
             ("dpkg-query", 0, "install ok installed", ""),
             (
                 "systemctl is-active fail2ban",
-                0 if active else 1,
+                0 if active else 3,
                 "active\n" if active else "inactive\n",
                 "",
             ),
@@ -186,6 +203,82 @@ def test_caddy_regex_ignores_benign_lines() -> None:
     ]
     for line in benign:
         assert host_of(line) is None, line
+
+
+CADDY_26_401 = (
+    '{"level":"error","ts":1795575108.713024,"logger":"http.log.access.log0",'
+    '"msg":"handled request","request":{"remote_ip":"127.0.0.1","remote_port":"47700",'
+    '"proto":"HTTP/1.1","method":"GET","host":"127.0.0.1:35263",'
+    '"uri":"/private?target=%22status%22","headers":{"User-Agent":["Python-urllib/3.15"],'
+    '"X-Forwarded-For":["198.51.100.4"],"Authorization":[],"Connection":["close"],'
+    '"Accept-Encoding":["identity"]}},"user_id":"","duration":0.000004969,"size":0,"status":401,'
+    '"resp_headers":{"Www-Authenticate":["Basic"],"Content-Type":[],"Server":["Caddy"]}}'
+)
+
+
+def _access_sample(
+    remote_ip: str,
+    *,
+    status: int = 401,
+    path: str = "/private",
+    ts: float = 1795597219.1234567,
+) -> str:
+    record: dict[str, object] = {
+        "level": "info",
+        "ts": ts,
+        "logger": "http.log.access.log0",
+        "msg": "handled request",
+        "request": {
+            "remote_ip": remote_ip,
+            "remote_port": "53451",
+            "client_ip": "192.0.2.70",
+            "proto": "HTTP/2.0",
+            "method": "GET",
+            "host": "edge.example",
+            "uri": f'{path}?x=","status":401,"uri":"/private"',
+            "headers": {
+                "X-Forwarded-For": ["198.51.100.40"],
+                "Authorization": ["REDACTED"],
+                "Lhm_Auth": ["protected"],
+            },
+            "tls": {
+                "resumed": False,
+                "version": 772,
+                "cipher_suite": 4865,
+                "proto": "h2",
+                "server_name": "edge.example",
+            },
+        },
+        "bytes_read": 0,
+        "user_id": "",
+        "duration": 0.004031863,
+        "size": 0,
+        "status": status,
+        "resp_headers": {"Www-Authenticate": ['Basic realm="restricted"']},
+    }
+    return json.dumps(record, separators=(",", ":"))
+
+
+@pytest.mark.parametrize("ts", [1795597219, 1795597219.1, 1795597219.1234567])
+def test_access_filter_uses_only_socket_peer_for_protected_401(ts: float) -> None:
+    parser = configparser.ConfigParser()
+    parser.read_string(fail2ban.desired_caddy_filter(protected_paths=("/private", "/other/auth")))
+    date = parser["Definition"]["datepattern"].replace("{EPOCH}", r"\d{10,11}\b(?:\.\d{3,6})?")
+    fail = parser["Definition"]["failregex"].replace("<ADDR>", r"(?P<ip>[\dA-Fa-f.:]+)")
+
+    def peer(line: str) -> str | None:
+        without_date = re.sub(date, lambda match: match[0][: match.start(1) - match.start()], line)
+        match = re.fullmatch(fail, without_date)
+        return match.group("ip") if match else None
+
+    assert peer(CADDY_26_401) == "127.0.0.1"
+    for ip in ("203.0.113.9", "2001:db8::9"):
+        assert peer(_access_sample(ip, ts=ts)) == ip
+        assert peer(_access_sample(ip, path="/other/auth", ts=ts)) == ip
+        for path in ("/private/no", "/private-other", "/%70rivate", "/public"):
+            assert peer(_access_sample(ip, path=path, ts=ts)) is None
+        for status in (200, 403, 404, 429):
+            assert peer(_access_sample(ip, status=status, ts=ts)) is None
 
 
 def test_invalid_duration_is_refused(fake_exec: Any, files: Path) -> None:
@@ -340,7 +433,8 @@ def test_apply_installs_writes_and_verifies(
         [
             ("dpkg-query -W -f=${Status} fail2ban", 1, "", "not installed"),
             ("dpkg-query -W -f=${Status} nftables", 1, "", "not installed"),
-            ("systemctl is-active fail2ban", 1, "inactive\n", ""),
+            ("systemctl is-active fail2ban", 3, "inactive\n", ""),
+            ("systemctl is-enabled fail2ban", 1, "disabled\n", ""),
             ("fail2ban-client status sshd", 0, JAIL_STATUS, ""),
             ("fail2ban-client get sshd bantime", 0, "28800\n", ""),
             ("fail2ban-client -d", 0, DEBUG_DUMP, ""),
@@ -394,6 +488,862 @@ def test_apply_caddy_writes_filter_and_enables_jail(
     assert names["verify caddy jail"] is Status.OK
 
 
+CADDY_RUNTIME = '{"apps":{"http":{"servers":{"srv0":{"listen":[":443"]}}}}}'
+CADDY_RUNTIME_PROBE = "fake-caddy-runtime-fingerprint"
+DIRECT_GENERATION = "1" * 32
+
+
+@pytest.fixture
+def direct_access(files: Path, monkeypatch: pytest.MonkeyPatch) -> fail2ban.DirectAccess:
+    log = fail2ban.CADDY_ACCESS_LOG
+    log.parent.mkdir()
+    log.parent.chmod(0o750)
+    log.write_text(CADDY_26_401 + "\n", encoding="utf-8")
+    log.chmod(0o640)
+
+    def probe(runner: Runner) -> caddy.RunningConfig | None:
+        result = runner.run([CADDY_RUNTIME_PROBE], check=False)
+        if not result.ok or not result.stdout:
+            return None
+        digest = hashlib.sha256(result.stdout.encode()).hexdigest()
+        return caddy.RunningConfig("1" * 32, digest, "edge.example", log, digest)
+
+    monkeypatch.setattr(caddy, "running_config_fingerprint", probe)
+    monkeypatch.setattr(fail2ban.secrets, "token_hex", lambda size: DIRECT_GENERATION)
+    monkeypatch.setattr(fail2ban.pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=os.getuid()))
+    monkeypatch.setattr(
+        caddy_guard,
+        "trusted_log",
+        lambda path, uid: path.is_file() and not path.stat().st_mode & 0o022,
+    )
+    digest = hashlib.sha256(CADDY_RUNTIME.encode()).hexdigest()
+    return fail2ban.DirectAccess(digest, ("/private",), DIRECT_GENERATION)
+
+
+def _fake_access_tools(
+    fake_exec: Any,
+    *,
+    runtime: str = CADDY_RUNTIME,
+    verified: bool = True,
+    missing_rule: bool = False,
+    absent: bool = False,
+    new_jail: str | None = None,
+    nft_cleanup: tuple[int, str] = (0, '{"nftables":[]}'),
+    mismatch: str | None = None,
+) -> Runner:
+    _fake_tools(fake_exec)
+    digest = hashlib.sha256(CADDY_RUNTIME.encode()).hexdigest()
+    policy = fail2ban.DirectAccess(digest, ("/private",), DIRECT_GENERATION)
+    jail = policy.jail
+    chain = """table inet f2b-table {
+    chain f2b-chain {
+        type filter hook input priority -1; policy accept;
+        tcp dport { 80, 443 } ip saddr @addr-set-caddy-lhm-access reject
+        tcp dport { 80, 443 } ip6 saddr @addr6-set-caddy-lhm-access reject
+        udp dport 443 ip saddr @addr-set-caddy-lhm-access-quic reject
+        udp dport 443 ip6 saddr @addr6-set-caddy-lhm-access-quic reject
+    }
+}
+"""
+    if missing_rule:
+        chain = chain.replace("udp dport 443 ip6 saddr @addr6-set-caddy-lhm-access-quic reject", "")
+    effective = new_jail or jail
+    chain = chain.replace(fail2ban.ACCESS_JAIL, effective)
+    expected_regex = "(?P<ip4>mock-compiled-attested-regex)"
+    guard = fail2ban._access_guard(policy).replace("%%", "%")
+    fake_exec.responses.extend(
+        [
+            ("systemctl is-enabled fail2ban", 1, "disabled\n", ""),
+            ("/usr/bin/python3 -I -c", 0, expected_regex, ""),
+            (CADDY_RUNTIME_PROBE, 0 if verified else 1, runtime, ""),
+            (f"fail2ban-client status {jail}", 0, f"Status for the jail: {jail}\n", ""),
+            (f"fail2ban-client status {effective}", 0, f"Status for the jail: {effective}\n", ""),
+            (
+                f"fail2ban-client get {effective} logpath",
+                0,
+                f"Current monitored log file(s):\n`- {fail2ban.CADDY_ACCESS_LOG}\n",
+                "",
+            ),
+            (
+                f"fail2ban-client get {effective} actions",
+                0,
+                "The jail has the following actions:\nnftables-multiport, nftables-caddy-quic",
+                "",
+            ),
+            (
+                f"fail2ban-client get {effective} failregex",
+                0,
+                "The following regular expression are defined:\n"
+                f"`- [0]: {'wrong' if mismatch == 'regex' else expected_regex}\n",
+                "",
+            ),
+            (
+                f"fail2ban-client get {effective} ignorecommand",
+                0,
+                "" if mismatch == "guard" else guard,
+                "",
+            ),
+            ("nft --numeric list chain inet f2b-table f2b-chain", 0, chain, ""),
+            ("nft --json list ruleset", nft_cleanup[0], nft_cleanup[1], ""),
+        ]
+    )
+
+    def execute(cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        result = fake_exec(cmd, timeout)
+        if cmd[:2] == ["fail2ban-client", "status"] and cmd[-1] in {jail, effective}:
+            queried = cmd[-1]
+            stopped = absent
+            for call in fake_exec.calls:
+                if call == ["fail2ban-client", "stop", queried]:
+                    stopped = True
+                if call == ["fail2ban-client", "reload", "--restart"]:
+                    stopped = False
+            if stopped:
+                return subprocess.CompletedProcess(cmd, 1, "", f"jail '{queried}' does not exist")
+        return result
+
+    return Runner(exec_fn=execute)
+
+
+@pytest.mark.parametrize("missing_rule", [False, True])
+def test_auto_caddy_verifies_effective_firewall_and_exact_file(
+    fake_exec: Any,
+    files: Path,
+    direct_access: fail2ban.DirectAccess,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_rule: bool,
+) -> None:
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+    runner = _fake_access_tools(fake_exec, missing_rule=missing_rule)
+    results = fail2ban.apply_fail2ban(
+        runner, caddy_direct=True, caddy_protected_paths=("/private",)
+    )
+    names = {r.name: r.status for r in results}
+    assert names["verify caddy log path"] is Status.OK
+    assert names["verify caddy nftables action"] is (Status.FAIL if missing_rule else Status.OK)
+    assert ["fail2ban-client", "-t"] in fake_exec.calls
+    assert not any("banip" in cmd for cmd in fake_exec.calls)
+    if missing_rule:
+        assert not fail2ban.JAIL_DROPIN.exists()
+        assert not fail2ban.CADDY_ACCESS_FILTER.exists()
+        assert ["fail2ban-client", "stop", direct_access.jail] in fake_exec.calls
+        return
+    dropin = fail2ban.JAIL_DROPIN.read_text(encoding="utf-8")
+    section = dropin.split(f"[{direct_access.jail}]")[1]
+    assert "enabled = true\n" in section
+    assert "backend = polling\n" in section
+    assert f"logpath = {fail2ban.CADDY_ACCESS_LOG} tail\n" in section
+    assert "usedns = no\n" in section
+    assert "maxretry = 5\n" in section
+    assert direct_access.digest in section
+    assert "ignorecommand = " in section
+    assert fail2ban.CADDY_ACCESS_FILTER.is_file()
+    assert not fail2ban.CADDY_FILTER.exists()
+    fake_exec.calls.clear()
+    results = fail2ban.apply_fail2ban(runner)
+    assert all(r.status is not Status.FAIL for r in results)
+    assert ["fail2ban-client", "reload", "--restart"] not in fake_exec.calls
+
+
+@pytest.mark.parametrize("unsafe", ["stale", "changed", "unmanaged", "unsafe-log", "missing"])
+def test_auto_caddy_fails_closed_and_removes_own_stale_jail(
+    fake_exec: Any,
+    files: Path,
+    direct_access: fail2ban.DirectAccess,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe: str,
+) -> None:
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+    if unsafe == "unmanaged":
+        monkeypatch.setattr(caddy, "running_config_fingerprint", lambda runner: None)
+    elif unsafe == "unsafe-log":
+        fail2ban.CADDY_ACCESS_LOG.chmod(0o666)
+    elif unsafe == "missing":
+        fail2ban.CADDY_ACCESS_LOG.unlink()
+    changed = CADDY_RUNTIME.replace("443", "444")
+    runner = _fake_access_tools(
+        fake_exec,
+        runtime=changed if unsafe in {"stale", "changed"} else CADDY_RUNTIME,
+        verified=unsafe != "stale",
+    )
+    path = fail2ban.JAIL_DROPIN
+    path.parent.mkdir(parents=True)
+    desired = fail2ban.desired_conf(bantime="16h", caddy_mode="file", direct=direct_access)
+    path.write_text(desired, encoding="utf-8")
+    fail2ban.apply_fail2ban(runner)
+    assert f"[{direct_access.jail}]" not in path.read_text(encoding="utf-8")
+    assert not fail2ban.CADDY_ACCESS_FILTER.exists()
+    assert ["fail2ban-client", "stop", direct_access.jail] in fake_exec.calls
+    assert ["fail2ban-client", "reload", "--restart"] in fake_exec.calls
+
+
+def test_existing_legacy_journald_mode_is_not_migrated(
+    fake_exec: Any,
+    files: Path,
+    direct_access: fail2ban.DirectAccess,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+    _fake_access_tools(fake_exec)
+    jail = fail2ban.JAIL_DROPIN
+    jail.parent.mkdir(parents=True)
+    legacy = fail2ban.desired_conf(caddy=True)
+    jail.write_text(legacy, encoding="utf-8")
+    fail2ban.apply_fail2ban(Runner(exec_fn=fake_exec))
+    assert jail.read_text(encoding="utf-8") == legacy
+    assert fail2ban.CADDY_FILTER.is_file()
+    assert not fail2ban.CADDY_ACCESS_FILTER.exists()
+
+
+def test_caddy_never_infers_topology_from_managed_log_and_samples(
+    fake_exec: Any,
+    direct_access: fail2ban.DirectAccess,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+    _fake_access_tools(fake_exec)
+    fail2ban.apply_fail2ban(Runner(exec_fn=fake_exec))
+    assert not fail2ban.CADDY_ACCESS_FILTER.exists()
+    assert fail2ban.ACCESS_JAIL not in fail2ban.JAIL_DROPIN.read_text(encoding="utf-8")
+    assert [CADDY_RUNTIME_PROBE] not in fake_exec.calls
+
+
+def test_revoke_caddy_attestation_stops_file_jail_without_legacy_fallback(
+    fake_exec: Any,
+    direct_access: fail2ban.DirectAccess,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+    runner = _fake_access_tools(fake_exec)
+    jail = fail2ban.JAIL_DROPIN
+    jail.parent.mkdir(parents=True)
+    desired = fail2ban.desired_conf(bantime="16h", caddy_mode="file", direct=direct_access)
+    jail.write_text(desired, encoding="utf-8")
+    results = fail2ban.apply_fail2ban(runner, caddy_revoke_direct=True)
+    assert all(r.status is not Status.FAIL for r in results)
+    assert jail.read_text(encoding="utf-8") == fail2ban.desired_conf(
+        bantime="16h",
+        caddy_mode="unmanaged",
+    )
+    assert ["fail2ban-client", "stop", direct_access.jail] in fake_exec.calls
+    assert not fail2ban.CADDY_FILTER.exists()
+    assert [CADDY_RUNTIME_PROBE] not in fake_exec.calls
+    assert not any(cmd[0] == "dpkg-query" for cmd in fake_exec.calls)
+    assert ["fail2ban-client", "reload", "--restart"] not in fake_exec.calls
+
+
+def _seed_file_jail(policy: fail2ban.DirectAccess) -> None:
+    jail, filter_path = fail2ban.JAIL_DROPIN, fail2ban.CADDY_ACCESS_FILTER
+    jail.parent.mkdir(parents=True)
+    filter_path.parent.mkdir(parents=True)
+    jail.write_text(fail2ban.desired_conf(caddy_mode="file", direct=policy), encoding="utf-8")
+    filter_path.write_text(
+        fail2ban.desired_caddy_filter(protected_paths=policy.protected_paths), encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize("leftover", ["set", "rule", "unreadable"])
+def test_revoke_refuses_unverified_nft_cleanup_and_retains_retry_marker(
+    fake_exec: Any,
+    direct_access: fail2ban.DirectAccess,
+    monkeypatch: pytest.MonkeyPatch,
+    leftover: str,
+) -> None:
+    _seed_file_jail(direct_access)
+    name = f"addr6-set-{direct_access.jail}-quic"
+    if leftover == "set":
+        ruleset = {"nftables": [{"set": {"name": name, "table": "f2b-table"}}]}
+    else:
+        ruleset = {"nftables": [{"rule": {"expr": [{"match": {"right": f"@{name}"}}]}}]}
+    cleanup = (1, "") if leftover == "unreadable" else (0, json.dumps(ruleset))
+    runner = _fake_access_tools(fake_exec, nft_cleanup=cleanup)
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+    result = fail2ban.apply_fail2ban(runner, caddy_revoke_direct=True)[-1]
+    assert result.status is Status.FAIL and "nftables" in result.detail
+    revoked = fail2ban.JAIL_DROPIN.read_text()
+    assert f"[{direct_access.jail}]" not in revoked
+    assert fail2ban._pending_access_cleanup(revoked) == direct_access.jail
+    assert ["fail2ban-client", "reload", "--restart"] not in fake_exec.calls
+    fake_exec.responses.insert(0, ("nft --json list ruleset", 0, '{"nftables":[]}', ""))
+    assert fail2ban.apply_fail2ban(runner, caddy_revoke_direct=True)[-1].status is Status.CHANGED
+    assert fail2ban._pending_access_cleanup(fail2ban.JAIL_DROPIN.read_text()) is None
+
+
+def test_revocation_fsync_orders_marker_stop_and_clear(
+    fake_exec: Any,
+    direct_access: fail2ban.DirectAccess,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_file_jail(direct_access)
+    runner = _fake_access_tools(fake_exec)
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+    observed: list[tuple[str | None, bool]] = []
+    sync = fail2ban._sync_jail_directory
+
+    def record_sync() -> None:
+        sync()
+        pending = fail2ban._pending_access_cleanup(fail2ban.JAIL_DROPIN.read_text())
+        stopped = ["fail2ban-client", "stop", direct_access.jail] in fake_exec.calls
+        observed.append((pending, stopped))
+
+    monkeypatch.setattr(fail2ban, "_sync_jail_directory", record_sync)
+    assert fail2ban.apply_fail2ban(runner, caddy_revoke_direct=True)[-1].status is Status.CHANGED
+    assert observed == [(direct_access.jail, False), (None, True)]
+
+
+def test_revoke_does_not_stop_when_marker_fsync_fails(
+    fake_exec: Any,
+    direct_access: fail2ban.DirectAccess,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_file_jail(direct_access)
+    runner = _fake_access_tools(fake_exec)
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+
+    def failed_fsync() -> None:
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr(fail2ban, "_sync_jail_directory", failed_fsync)
+    assert fail2ban.apply_fail2ban(runner, caddy_revoke_direct=True)[-1].status is Status.FAIL
+    assert not any(cmd[:2] == ["fail2ban-client", "stop"] for cmd in fake_exec.calls)
+
+
+@pytest.mark.parametrize("override", ["filter", "precedence"])
+def test_rechecks_override_after_config_validation_before_reload(
+    fake_exec: Any,
+    direct_access: fail2ban.DirectAccess,
+    monkeypatch: pytest.MonkeyPatch,
+    override: str,
+) -> None:
+    host = _fake_access_tools(fake_exec)
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+    external = (
+        fail2ban.CADDY_ACCESS_FILTER.with_suffix(".local")
+        if override == "filter"
+        else fail2ban.JAIL_DROPIN.parent / "zzz-unmanaged.local"
+    )
+
+    def execute(cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        if cmd == ["fail2ban-client", "-t"]:
+            external.write_text("[caddy]\nenabled = true\n")
+        return host.exec_fn(cmd, timeout)
+
+    results = fail2ban.apply_fail2ban(
+        Runner(exec_fn=execute),
+        caddy_direct=True,
+        caddy_protected_paths=direct_access.protected_paths,
+    )
+    assert results[-1].status is Status.FAIL
+    assert "override" in results[-1].detail or "precedence" in results[-1].detail
+    assert external.exists()
+    assert not fail2ban.JAIL_DROPIN.exists()
+    assert ["fail2ban-client", "reload", "--restart"] not in fake_exec.calls
+
+
+def test_reload_failure_restores_prior_ssh_without_resurrecting_revoked_caddy(
+    fake_exec: Any,
+    direct_access: fail2ban.DirectAccess,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old = direct_access
+    new = fail2ban.DirectAccess(old.digest, old.protected_paths, "2" * 32)
+    _seed_file_jail(old)
+    jail_path = fail2ban.JAIL_DROPIN
+    jail_path.write_text(fail2ban.desired_conf(bantime="16h", caddy_mode="file", direct=old))
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+    monkeypatch.setattr(fail2ban.secrets, "token_hex", lambda size: new.generation)
+    host = _fake_access_tools(fake_exec, new_jail=new.jail)
+    reloads: list[str] = []
+
+    def execute(cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        result = host.exec_fn(cmd, timeout)
+        if cmd == ["fail2ban-client", "reload", "--restart"]:
+            reloads.append(jail_path.read_text())
+            if len(reloads) == 1:
+                return subprocess.CompletedProcess(cmd, 1, "", "reload failed")
+        return result
+
+    results = fail2ban.apply_fail2ban(
+        Runner(exec_fn=execute),
+        caddy_direct=True,
+        caddy_protected_paths=old.protected_paths,
+    )
+    assert results[-1].status is Status.FAIL
+    assert len(reloads) == 2
+    assert new.jail in reloads[0]
+    assert reloads[1] == fail2ban.desired_conf(bantime="16h", caddy_mode="unmanaged")
+    assert all(old.jail not in conf for conf in reloads)
+    assert ["fail2ban-client", "stop", new.jail] in fake_exec.calls
+
+
+@pytest.mark.parametrize("mismatch", ["regex", "guard"])
+def test_bad_live_policy_is_revoked_even_with_same_policy_identity(
+    fake_exec: Any,
+    direct_access: fail2ban.DirectAccess,
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch: str,
+) -> None:
+    _seed_file_jail(direct_access)
+    runner = _fake_access_tools(fake_exec, mismatch=mismatch)
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+    results = fail2ban.apply_fail2ban(runner, bantime="16h")
+    assert results[-1].status is Status.FAIL
+    assert mismatch in results[-1].detail
+    assert ["fail2ban-client", "stop", direct_access.jail] in fake_exec.calls
+    assert fail2ban.JAIL_DROPIN.read_text() == fail2ban.desired_conf(caddy_mode="unmanaged")
+
+
+def test_restore_ssh_atomically_preserves_pending_new_jail_cleanup(
+    fake_exec: Any,
+    direct_access: fail2ban.DirectAccess,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = fail2ban.JAIL_DROPIN
+    path.parent.mkdir(parents=True)
+    previous = fail2ban.desired_conf(bantime="16h")
+    path.write_text(previous)
+    runner = _fake_access_tools(fake_exec, mismatch="guard", nft_cleanup=(1, ""))
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+    original = fail2ban._write_managed
+    rollback = fail2ban.rollback_file
+    replacements: list[str] = []
+
+    def write(path_to_write: Path, content: str, **kwargs: Any) -> str:
+        result = original(path_to_write, content, **kwargs)
+        if path_to_write == path:
+            replacements.append(path.read_text())
+        return result
+
+    def restore(path_to_restore: Path, *, backup: Path | None = None) -> Path:
+        assert path_to_restore != path, "must not replace the jail file with an unmarked backup"
+        return rollback(path_to_restore, backup=backup)
+
+    monkeypatch.setattr(fail2ban, "_write_managed", write)
+    monkeypatch.setattr(fail2ban, "rollback_file", restore)
+    results = fail2ban.apply_fail2ban(
+        runner, caddy_direct=True, caddy_protected_paths=direct_access.protected_paths
+    )
+    assert results[-1].status is Status.FAIL
+    assert len(replacements) >= 3
+    assert all(
+        fail2ban._pending_access_cleanup(text) == direct_access.jail for text in replacements[1:]
+    )
+    assert "bantime = 16h" in replacements[-1]
+    assert f"[{direct_access.jail}]" not in replacements[-1]
+
+
+@pytest.mark.parametrize("request_type", ["direct", "ssh", "default"])
+def test_apply_with_pending_cleanup_cannot_report_ignored_settings_as_success(
+    fake_exec: Any,
+    direct_access: fail2ban.DirectAccess,
+    monkeypatch: pytest.MonkeyPatch,
+    request_type: str,
+) -> None:
+    _seed_file_jail(direct_access)
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+    pending = fail2ban._record_access_revocation(
+        fail2ban.JAIL_DROPIN.read_text(), direct_access.jail
+    )
+    assert fail2ban._pending_access_cleanup(pending) == direct_access.jail
+    host = _fake_access_tools(fake_exec)
+    fake_exec.responses.insert(0, ("nft --json list ruleset", 0, '{"nftables":[]}', ""))
+    direct = request_type == "direct"
+    results = fail2ban.apply_fail2ban(
+        host,
+        bantime="16h" if request_type == "ssh" else fail2ban.SSHD_BANTIME,
+        caddy_direct=direct,
+        caddy_protected_paths=direct_access.protected_paths if direct else (),
+    )
+    assert results[-1].status is Status.FAIL and "rerun" in results[-1].detail
+    assert fail2ban._pending_access_cleanup(fail2ban.JAIL_DROPIN.read_text()) is None
+    assert "bantime = 16h" not in fail2ban.JAIL_DROPIN.read_text()
+    assert [CADDY_RUNTIME_PROBE] not in fake_exec.calls
+    assert ["fail2ban-client", "reload", "--restart"] not in fake_exec.calls
+
+
+@pytest.mark.parametrize("fail_at", ["install", "config-test"])
+@pytest.mark.parametrize("previously_absent", [True, False])
+def test_first_install_autostart_is_reversed_on_failure_before_activation(
+    fake_exec: Any,
+    files: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fail_at: str,
+    previously_absent: bool,
+) -> None:
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+    installed, active = False, False
+    enable = "not-found" if previously_absent else "enabled-runtime"
+    initial_enable = enable
+
+    def execute(cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        fake_exec(cmd, timeout)
+
+        def result(code: int = 0, text: str = "") -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(cmd, code, text, "")
+
+        nonlocal installed, active, enable
+        if cmd == ["dpkg-query", "-W", "-f=${Status}", "fail2ban"]:
+            return result(1)
+        if cmd == ["systemctl", "is-active", "fail2ban"]:
+            if enable == "not-found":
+                return result(4, "unknown")
+            return result(0, "active") if active else result(3, "inactive")
+        if cmd == ["systemctl", "is-enabled", "fail2ban"]:
+            return result(1 if enable in {"not-found", "disabled"} else 0, enable)
+        if cmd == ["systemctl", "show", "--property=LoadState", "--value", "fail2ban"]:
+            return result(0, "not-found" if enable == "not-found" else "loaded")
+        if cmd[:4] == ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install"]:
+            installed, active, enable = True, True, "enabled"
+            return result(1 if fail_at == "install" else 0)
+        if cmd == ["fail2ban-client", "-t"]:
+            return result(1)
+        if cmd == ["systemctl", "stop", "fail2ban"]:
+            active = False
+        if cmd == ["systemctl", "disable", "fail2ban"]:
+            enable = "disabled"
+        if cmd == ["systemctl", "enable", "--runtime", "fail2ban"]:
+            enable = "enabled-runtime"
+        return result()
+
+    results = fail2ban.apply_fail2ban(Runner(exec_fn=execute))
+    assert results[-1].status is Status.FAIL
+    assert "packages may remain" in results[-1].detail
+    assert installed and not active
+    assert enable == ("disabled" if previously_absent else initial_enable)
+    assert not fail2ban.JAIL_DROPIN.exists()
+    assert ["fail2ban-client", "reload", "--restart"] not in fake_exec.calls
+    assert ["systemctl", "enable", "--now", "fail2ban"] not in fake_exec.calls
+
+
+@pytest.mark.parametrize("boot_state", ["enabled", "disabled", "enabled-runtime"])
+@pytest.mark.parametrize("fail_at", ["enable", "verify"])
+def test_activation_failure_restores_boot_and_active_state_independently(
+    fake_exec: Any,
+    direct_access: fail2ban.DirectAccess,
+    monkeypatch: pytest.MonkeyPatch,
+    boot_state: str,
+    fail_at: str,
+) -> None:
+    host = _fake_access_tools(fake_exec, mismatch="guard")
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+    active, enable = False, boot_state
+
+    def execute(cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        nonlocal active, enable
+        result = host.exec_fn(cmd, timeout)
+        if cmd == ["systemctl", "is-active", "fail2ban"]:
+            state = "active" if active else "inactive"
+            return subprocess.CompletedProcess(cmd, 0 if active else 3, state)
+        if cmd == ["systemctl", "is-enabled", "fail2ban"]:
+            return subprocess.CompletedProcess(cmd, 0 if enable != "disabled" else 1, enable)
+        if cmd == ["systemctl", "enable", "--now", "fail2ban"]:
+            active, enable = True, "enabled"
+            if fail_at == "enable":
+                return subprocess.CompletedProcess(cmd, 1, "", "partially applied")
+        elif cmd == ["systemctl", "stop", "fail2ban"]:
+            active = False
+        elif cmd == ["systemctl", "disable", "fail2ban"]:
+            enable = "disabled"
+        elif cmd == ["systemctl", "enable", "--runtime", "fail2ban"]:
+            enable = "enabled-runtime"
+        return result
+
+    results = fail2ban.apply_fail2ban(
+        Runner(exec_fn=execute),
+        caddy_direct=True,
+        caddy_protected_paths=direct_access.protected_paths,
+    )
+    assert results[-1].status is Status.FAIL
+    assert not active and enable == boot_state
+
+
+def test_explicit_reassurance_uses_new_ticket_namespace_even_for_same_config(
+    fake_exec: Any,
+    direct_access: fail2ban.DirectAccess,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old = direct_access
+    new = fail2ban.DirectAccess(old.digest, old.protected_paths, "2" * 32)
+    _seed_file_jail(old)
+    runner = _fake_access_tools(fake_exec, new_jail=new.jail)
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+    monkeypatch.setattr(fail2ban.secrets, "token_hex", lambda size: new.generation)
+    results = fail2ban.apply_fail2ban(
+        runner, caddy_direct=True, caddy_protected_paths=old.protected_paths
+    )
+    assert all(r.status is not Status.FAIL for r in results)
+    assert old.jail != new.jail
+    assert ["fail2ban-client", "stop", old.jail] in fake_exec.calls
+    assert fail2ban.inspect(runner)["caddy_jail"] == new.jail
+    assert fail2ban.inspect(runner)["caddy_mode"] == "file"
+
+
+def test_unchanged_policy_restarts_a_stopped_file_jail(
+    fake_exec: Any,
+    direct_access: fail2ban.DirectAccess,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_file_jail(direct_access)
+    runner = _fake_access_tools(fake_exec, absent=True)
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+    before = fail2ban.JAIL_DROPIN.read_bytes()
+    results = fail2ban.apply_fail2ban(runner)
+    assert all(r.status is not Status.FAIL for r in results)
+    assert ["fail2ban-client", "reload", "--restart"] in fake_exec.calls
+    assert fail2ban.JAIL_DROPIN.read_bytes() == before
+
+
+def test_file_config_validation_failure_restores_previous_ssh_and_filter(
+    fake_exec: Any,
+    direct_access: fail2ban.DirectAccess,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _fake_access_tools(fake_exec)
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+    fake_exec.responses.insert(0, ("fail2ban-client -t", 1, "", "invalid full configuration"))
+    jail, filter_path = fail2ban.JAIL_DROPIN, fail2ban.CADDY_ACCESS_FILTER
+    jail.parent.mkdir(parents=True)
+    filter_path.parent.mkdir(parents=True)
+    jail.write_text(fail2ban.desired_conf(bantime="16h"), encoding="utf-8")
+    filter_path.write_text(
+        fail2ban.desired_caddy_filter(protected_paths=("/previous",)), encoding="utf-8"
+    )
+    baseline = (jail.read_bytes(), filter_path.read_bytes())
+    results = fail2ban.apply_fail2ban(
+        runner, caddy_direct=True, caddy_protected_paths=direct_access.protected_paths
+    )
+    assert results[-1].status is Status.FAIL
+    assert (jail.read_bytes(), filter_path.read_bytes()) == baseline
+    assert ["fail2ban-client", "reload", "--restart"] not in fake_exec.calls
+
+
+def test_apply_does_not_interleave_with_caddy_transaction(fake_exec: Any, files: Path) -> None:
+    with locked_target(caddy.CADDYFILE.parent):
+        (result,) = fail2ban.apply_fail2ban(Runner(exec_fn=fake_exec))
+    assert result.status is Status.FAIL
+    assert "locked" in result.detail
+    assert fake_exec.calls == []
+
+
+def test_apply_keeps_both_locks_through_final_verification(
+    fake_exec: Any,
+    files: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_tools(fake_exec)
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+    verified = False
+
+    def execute(cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        nonlocal verified
+        if cmd == ["fail2ban-client", "status", "sshd"]:
+            verified = True
+            for path in (caddy.CADDYFILE.parent, fail2ban.JAIL_DROPIN.parents[1]):
+                with pytest.raises(BlockingIOError), locked_target(path):
+                    pytest.fail("verification must still hold both locks")
+        return fake_exec(cmd, timeout)
+
+    results = fail2ban.apply_fail2ban(Runner(exec_fn=execute))
+    assert all(r.status is not Status.FAIL for r in results)
+    assert verified
+
+
+def test_caddy_transition_can_revoke_only_the_file_jail(
+    fake_exec: Any,
+    direct_access: fail2ban.DirectAccess,
+) -> None:
+    _seed_file_jail(direct_access)
+    dropin = fail2ban.JAIL_DROPIN
+    dropin.write_text(
+        fail2ban.desired_conf(bantime="16h", caddy_mode="file", direct=direct_access),
+        encoding="utf-8",
+    )
+    runner = _fake_access_tools(fake_exec)
+    with locked_target(caddy.CADDYFILE.parent):
+        assert fail2ban.stop_managed_caddy_access(runner, revoke=True)
+    assert dropin.read_text(encoding="utf-8") == fail2ban.desired_conf(
+        bantime="16h",
+        caddy_mode="unmanaged",
+    )
+    assert ["fail2ban-client", "stop", direct_access.jail] in fake_exec.calls
+    assert ["nft", "--json", "list", "ruleset"] in fake_exec.calls
+    assert ["fail2ban-client", "reload", "--restart"] not in fake_exec.calls
+
+
+def test_apply_reprobes_running_attestation_after_confirmation(
+    fake_exec: Any,
+    direct_access: fail2ban.DirectAccess,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _fake_access_tools(fake_exec)
+
+    def confirm(plan: list[str]) -> bool:
+        fake_exec.responses.insert(0, (CADDY_RUNTIME_PROBE, 0, '{"changed":true}', ""))
+        return True
+
+    monkeypatch.setattr(fail2ban, "confirm_once", confirm)
+    results = fail2ban.apply_fail2ban(
+        runner, caddy_direct=True, caddy_protected_paths=direct_access.protected_paths
+    )
+    assert results[-1].status is Status.FAIL
+    assert "eligibility changed" in results[-1].detail
+    assert not fail2ban.JAIL_DROPIN.exists()
+
+
+@pytest.mark.parametrize(("rc", "state"), [(1, ""), (3, "activating"), (0, ""), (4, "unknown")])
+def test_unknown_fail2ban_service_status_cannot_trigger_activation(
+    fake_exec: Any,
+    files: Path,
+    rc: int,
+    state: str,
+) -> None:
+    _fake_tools(fake_exec)
+    fake_exec.responses.insert(0, ("systemctl is-active fail2ban", rc, state, ""))
+    (result,) = fail2ban.apply_fail2ban(Runner(exec_fn=fake_exec))
+    assert result.status is Status.FAIL
+    assert "cannot determine stable" in result.detail
+    assert not fail2ban.JAIL_DROPIN.exists()
+    assert not any(cmd[:2] == ["systemctl", "enable"] for cmd in fake_exec.calls)
+
+
+def test_guard_reopens_rotated_file_and_refuses_writable_or_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = tmp_path / "caddy"
+    directory.mkdir(mode=0o750)
+    log = directory / "access.log"
+    log.write_text("first\n", encoding="utf-8")
+    log.chmod(0o640)
+    original = os.fstat
+
+    def ancestors(fd: int) -> os.stat_result:
+        meta = original(fd)
+        path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        if path not in {directory, log}:
+            fields = list(meta)
+            fields[0] &= ~0o022
+            fields[4] = 0
+            return os.stat_result(fields)
+        return meta
+
+    monkeypatch.setattr(caddy_guard.os, "fstat", ancestors)
+    assert caddy_guard.trusted_log(log, os.getuid())
+    original_log = log.rename(directory / "rolled.log")
+    log.write_text("rotated\n", encoding="utf-8")
+    log.chmod(0o640)
+    assert caddy_guard.trusted_log(log, os.getuid())
+    assert not caddy_guard.trusted_log(log, os.getuid() + 1)
+    log.chmod(0o660)
+    assert not caddy_guard.trusted_log(log, os.getuid())
+    log.unlink()
+    log.symlink_to(original_log)
+    with pytest.raises(OSError):
+        caddy_guard.trusted_log(log, os.getuid())
+
+
+def test_guard_binds_unix_admin_response_to_main_pid(tmp_path: Path) -> None:
+    body = b'{"apps":{}}'
+    path = tmp_path / "admin.sock"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+        server.bind(str(path))
+        server.listen()
+        server.settimeout(2)
+        with pytest.raises(ValueError, match="wrong Caddy admin socket peer"):
+            caddy_guard.runtime_digest(str(path), os.getpid() + 1)
+        stale, _ = server.accept()
+        stale.close()
+
+        def respond() -> None:
+            connection, _ = server.accept()
+            with connection:
+                connection.settimeout(2)
+                assert connection.recv(1024).startswith(b"GET /config/ HTTP/1.0")
+                connection.sendall(b"HTTP/1.0 200 OK\r\n\r\n" + body + b"\n")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            response = executor.submit(respond)
+            expected = hashlib.sha256(body).hexdigest()
+            assert caddy_guard.runtime_digest(str(path), os.getpid()) == expected
+            response.result(timeout=2)
+
+
+def test_guard_rejects_service_replaced_during_admin_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    states = iter([(42, "a" * 32), (43, "b" * 32)])
+    monkeypatch.setattr(caddy_guard, "service", lambda: next(states))
+    monkeypatch.setattr(caddy_guard.pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=7))
+    monkeypatch.setattr(caddy_guard, "trusted_log", lambda path, uid: True)
+    monkeypatch.setattr(caddy_guard, "runtime_digest", lambda path, pid: "2" * 64)
+    assert not caddy_guard.permits("2" * 64, "/socket", tmp_path / "access.log")
+
+
+@pytest.mark.parametrize("path", ["/admin/../login", "/login?token=x", "/api/*", "/a//b"])
+def test_direct_attestation_refuses_nonliteral_paths(
+    fake_exec: Any,
+    files: Path,
+    path: str,
+) -> None:
+    (result,) = fail2ban.apply_fail2ban(
+        Runner(exec_fn=fake_exec), caddy_direct=True, caddy_protected_paths=(path,)
+    )
+    assert result.status is Status.FAIL
+    assert "literal protected paths" in result.detail
+    assert fake_exec.calls == []
+
+
+def test_auto_caddy_refuses_single_retry(
+    fake_exec: Any,
+    files: Path,
+    direct_access: fail2ban.DirectAccess,
+) -> None:
+    _fake_access_tools(fake_exec)
+    (result,) = fail2ban.apply_fail2ban(
+        Runner(exec_fn=fake_exec),
+        caddy_maxretry="1",
+        caddy_direct=True,
+        caddy_protected_paths=("/private",),
+    )
+    assert result.status is Status.FAIL
+    assert "at least 2" in result.detail
+    assert not fail2ban.JAIL_DROPIN.exists()
+
+
+@pytest.mark.parametrize("relative", ["jail.conf", "jail.local", "jail.d/admin.local"])
+def test_external_caddy_jail_remains_authoritative(
+    fake_exec: Any,
+    files: Path,
+    direct_access: fail2ban.DirectAccess,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: str,
+) -> None:
+    monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
+    _fake_access_tools(fake_exec)
+    external = files / relative
+    external.parent.mkdir(parents=True, exist_ok=True)
+    baseline = "[caddy]\nenabled = true\n"
+    external.write_text(baseline, encoding="utf-8")
+    fail2ban.apply_fail2ban(Runner(exec_fn=fake_exec), caddy=True)
+    assert external.read_text(encoding="utf-8") == baseline
+    assert "\n[caddy" not in fail2ban.JAIL_DROPIN.read_text(encoding="utf-8")
+    assert not fail2ban.CADDY_FILTER.exists()
+    assert not fail2ban.CADDY_ACCESS_FILTER.exists()
+
+
+def test_refuses_unmanaged_file_at_managed_jail_path(fake_exec: Any, files: Path) -> None:
+    path = fail2ban.JAIL_DROPIN
+    path.parent.mkdir(parents=True)
+    baseline = "[caddy]\nenabled = true\n"
+    path.write_text(baseline, encoding="utf-8")
+    (result,) = fail2ban.apply_fail2ban(Runner(exec_fn=fake_exec))
+    assert result.status is Status.FAIL
+    assert "unmanaged" in result.detail
+    assert path.read_text(encoding="utf-8") == baseline
+    assert fake_exec.calls == []
+
+
 def test_restart_jails_when_already_active(
     fake_exec: Any, files: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -405,7 +1355,7 @@ def test_restart_jails_when_already_active(
     is never created.
     """
     (files / "jail.d").mkdir(parents=True)
-    (files / "jail.d" / "99-lhm.local").write_text("[DEFAULT]\n", encoding="utf-8")
+    (files / "jail.d" / "99-lhm.local").write_text(fail2ban.JAIL_HEADER, encoding="utf-8")
     monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
     _fake_tools(fake_exec, active=True)
     results = fail2ban.apply_fail2ban(Runner(exec_fn=fake_exec))
@@ -425,7 +1375,7 @@ def test_restart_path_enables_when_inactive(
     fake_exec: Any, files: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (files / "jail.d").mkdir(parents=True)
-    (files / "jail.d" / "99-lhm.local").write_text("[DEFAULT]\n", encoding="utf-8")
+    (files / "jail.d" / "99-lhm.local").write_text(fail2ban.JAIL_HEADER, encoding="utf-8")
     monkeypatch.setattr(fail2ban, "confirm_once", lambda plan: True)
     _fake_tools(fake_exec, active=False)
     fail2ban.apply_fail2ban(Runner(exec_fn=fake_exec))
@@ -487,7 +1437,7 @@ def test_verify_degrades_to_skipped_without_client(
     fake_exec.responses.extend(
         [
             ("dpkg-query", 0, "install ok installed", ""),
-            ("systemctl is-active fail2ban", 1, "inactive\n", ""),
+            ("systemctl is-active fail2ban", 3, "inactive\n", ""),
             ("fail2ban-client", 127, "", "fail2ban-client: command not found"),
         ]
     )

@@ -18,7 +18,13 @@ from lhm.core import colors
 from lhm.core.backup import backup_file
 from lhm.core.mutations import mutations_allowed
 
-TEMPLATES_DIR = Path(__file__).resolve().parents[3] / "templates"
+_PACKAGE_DIR = Path(__file__).resolve().parents[1]
+_PACKAGED_TEMPLATES = _PACKAGE_DIR / "templates"
+TEMPLATES_DIR = (
+    _PACKAGE_DIR.parents[1] / "templates"
+    if _PACKAGE_DIR.parent.name == "src" and not _PACKAGED_TEMPLATES.is_dir()
+    else _PACKAGED_TEMPLATES
+)
 
 WriteOutcome = Literal["skipped", "written", "planned"]
 AppendOutcome = Literal["skipped", "appended", "planned"]
@@ -39,7 +45,7 @@ def _reject_symlink(path: Path) -> None:
 
 
 @contextmanager
-def locked_target(path: str | Path) -> Iterator[None]:
+def locked_target(path: str | Path) -> Iterator[int | None]:
     """Serialize cooperating writers; fail immediately if the target is locked.
 
     The managed parent must already exist and be trusted. The lock persists
@@ -88,7 +94,7 @@ def locked_target(path: str | Path) -> Iterator[None]:
             if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
                 raise OSError(errno.ESTALE, "target lock file changed", lock)
             _reject_symlink(p)
-            yield
+            yield lock_fd
         finally:
             os.close(lock_fd)
     finally:

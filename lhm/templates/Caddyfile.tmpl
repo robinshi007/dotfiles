@@ -1,0 +1,46 @@
+# lhm-managed Caddyfile
+# site: $site
+# upstream: $upstream
+{
+	admin unix/$admin_socket
+	# The explicit redirect below fixes the destination and removes Server.
+	auto_https disable_redirects
+}
+
+http:// {
+	header -Server
+	@site host $site
+	redir @site https://$site{uri} 308
+	respond 404
+}
+
+https:// {
+	header -Server
+	respond 404
+}
+
+$site {
+	header -Server
+	log {
+		output file $access_log {
+			mode 0640
+			roll_size $roll_size
+			roll_keep $roll_keep
+		}
+		format json
+	}
+
+	@connect method CONNECT
+	respond @connect 405
+	request_header -Forwarded
+	request_header -X-Real-IP
+	request_header -X-Forwarded-*
+	reverse_proxy $upstream {
+		header_down -Server
+	}
+
+	handle_errors {
+		header -Server
+		respond "{err.status_text}" {err.status_code}
+	}
+}

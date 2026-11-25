@@ -48,7 +48,11 @@ printf '%s\n' "$before" | sed 's/^/    before| /'
 
 # Second pass: the same three modules, unchanged arguments.
 for module in "ssh-hardening" "sysctl" "fail2ban"; do
-    run_lhm apply "$module"
+    if [[ "$module" == ssh-hardening ]]; then
+        run_lhm apply "$module" --ssh-user deploy
+    else
+        run_lhm apply "$module"
+    fi
     expect_lhm_ok "second apply $module"
     assert_not_contains "$LHM_OUT" "CHANGED" "second apply $module: no CHANGED"
     assert_contains "$LHM_OUT" "SKIPPED" "second apply $module: SKIPPED reported"

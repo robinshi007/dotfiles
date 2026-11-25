@@ -448,7 +448,7 @@ def test_bootstrap_dispatches_only_valid_expiry(
     assert watchdog.main("expire", "../bad") == 64
     assert watchdog.main("probe", TXID) == 0
     assert json.loads(capsys.readouterr().out) == {
-        "protocol": 1,
+        "protocol": 4,
         "schema": 1,
         "build": watchdog._build_id(Path(watchdog.__file__).parents[1]),
     }

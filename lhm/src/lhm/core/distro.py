@@ -19,7 +19,7 @@ class DistroBackend(Protocol):
 
     def update(self) -> None: ...
 
-    def upgrade(self, security_only: bool = False) -> None: ...
+    def upgrade(self) -> None: ...
 
 
 class AptBackend:
@@ -57,11 +57,7 @@ class AptBackend:
         env = ["env", "DEBIAN_FRONTEND=noninteractive"]
         self.runner.run([*env, APT_GET, "update", "-q"], timeout=APT_TIMEOUT)
 
-    def upgrade(self, security_only: bool = False) -> None:
+    def upgrade(self) -> None:
         self._require_apt()
         env = ["env", "DEBIAN_FRONTEND=noninteractive"]
-        if security_only:
-            # unattended-upgrade honours Allowed-Origins (security only).
-            self.runner.run([*env, "unattended-upgrade"], timeout=APT_TIMEOUT)
-        else:
-            self.runner.run([*env, APT_GET, "upgrade", "-y", "-q"], timeout=APT_TIMEOUT)
+        self.runner.run([*env, APT_GET, "upgrade", "-y", "-q"], timeout=APT_TIMEOUT)

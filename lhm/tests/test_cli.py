@@ -1,10 +1,12 @@
 import json
+import sys
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
+from types import ModuleType, SimpleNamespace
+from typing import Any, Literal
 from unittest.mock import Mock
 
 import pytest
+from conftest import FakeExec
 
 from lhm import cli
 from lhm.core.confirm import BYPASS_ENV
@@ -17,11 +19,98 @@ def _isolate_ssh_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli.ssh_module, "HOME_ROOT", tmp_path / "absent-home")
 
 
-def test_query_system_no_traceback(fake_exec: Any, capsys: pytest.CaptureFixture[str]) -> None:
-    assert cli.main(["query", "system"]) == 0
-    out = capsys.readouterr().out
-    assert "hostname" in out
-    assert fake_exec.calls == []  # system probe is pure stdlib
+def test_query_system_has_local_info_without_public_ip(
+    fake_exec: FakeExec, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    assert cli.main(["query", "system", "--json"]) == cli.EXIT_OK
+    data = json.loads(capsys.readouterr().out)
+    text_identity = ["hostname", "distro", "kernel", "arch", "python", "user"]
+    assert list(data)[:7] == [*text_identity, "root"]
+    assert all(isinstance(data[key], str) and data[key] for key in text_identity)
+    assert isinstance(data["root"], bool)
+    assert "public_ip" not in data["network"]
+    assert all(cmd[0] != "curl" for cmd in fake_exec.calls)
+
+
+@pytest.mark.parametrize(("response", "public_ip"), [("8.8.8.8\n", "8.8.8.8"), ("invalid", None)])
+def test_query_system_public_ip_is_explicit(
+    response: str,
+    public_ip: str | None,
+    fake_exec: FakeExec,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fake_exec.responses.append(("curl", 0, response, ""))
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    assert cli.main(["query", "system", "--public-ip", "--json"]) == cli.EXIT_OK
+    data = json.loads(capsys.readouterr().out)
+    assert data["network"]["public_ip"] == {"ipv4": public_ip, "ipv6": None}
+    assert sum(cmd[0] == "curl" for cmd in fake_exec.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["query", "all", "--public-ip"],
+        ["query", "ssh", "--public-ip"],
+        ["query", "system", "--public-ip", "--dry-run"],
+        ["--dry-run", "query", "system", "--public-ip"],
+        ["query", "caddy", "--site", "example.com"],
+        ["apply", "caddy", "--site", "example.com"],
+        ["apply", "caddy", "--upstream", "127.0.0.1:8080"],
+        ["apply", "fail2ban", "--caddy-direct"],
+        ["apply", "fail2ban", "--caddy-protected-path", "/admin"],
+        ["apply", "fail2ban", "--caddy", "--caddy-direct", "--caddy-protected-path", "/admin"],
+        ["apply", "fail2ban", "--caddy-revoke-direct", "--caddy"],
+        [
+            "apply",
+            "fail2ban",
+            "--caddy-revoke-direct",
+            "--caddy-direct",
+            "--caddy-protected-path",
+            "/admin",
+        ],
+        ["apply", "fail2ban", "--caddy-revoke-direct", "--caddy-protected-path", "/admin"],
+        ["apply", "all", "--caddy-direct"],
+        ["apply", "all", "--caddy-protected-path", "/admin"],
+        ["apply", "all", "--caddy-revoke-direct"],
+    ],
+)
+def test_opt_in_flags_require_the_right_command(
+    args: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = Mock(side_effect=AssertionError("usage errors must not reach the runner"))
+    monkeypatch.setattr(cli, "Runner", runner)
+    with pytest.raises(SystemExit, match=str(cli.EXIT_USAGE)):
+        cli.main(args)
+    runner.assert_not_called()
+
+
+def test_caddy_query_and_explicit_apply_dispatch(
+    fake_exec: FakeExec, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = {"installed": True, "active": False}
+    inspect = Mock(return_value=state)
+    apply = Mock(return_value=[StepResult("caddy", Status.PLANNED, "dry run")])
+    caddy = ModuleType("lhm.modules.caddy")
+    setattr(caddy, "inspect", inspect)
+    setattr(caddy, "CaddyModule", lambda: SimpleNamespace(implemented=True, apply=apply))
+    monkeypatch.setitem(sys.modules, caddy.__name__, caddy)
+    runner = Runner(exec_fn=fake_exec)
+    monkeypatch.setattr(cli, "Runner", lambda **_kwargs: runner)
+    assert "caddy" not in cli.APPLY_ALL_ORDER
+
+    assert cli.main(["query", "caddy", "--json"]) == cli.EXIT_OK
+    assert json.loads(capsys.readouterr().out) == state
+    inspect.assert_called_once_with(runner)
+    apply.assert_not_called()
+
+    runner.dry_run = True
+    args = ["apply", "caddy", "--site", "example.com", "--upstream", "127.0.0.1:8080", "--dry-run"]
+    assert cli.main(args) == cli.EXIT_OK
+    apply.assert_called_once_with(runner, site="example.com", upstream="127.0.0.1:8080")
+    assert fake_exec.calls == []
 
 
 def test_query_ports_json(fake_exec: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -98,14 +187,70 @@ def test_check_reports_needs_change_areas(
 ) -> None:
     from lhm.modules import updates
 
-    monkeypatch.setattr(updates, "APT_CONF", Path("/nonexistent/51-lhm"))
+    monkeypatch.setattr(
+        updates, "inspect", lambda _runner: {"installed": False, "apt_conf_current": False}
+    )
     monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
-    fake_exec.responses.append(("dpkg-query", 1, "", ""))
     assert cli.main(["check"]) == 0
     out = capsys.readouterr().out
     assert "needs-change" in out
-    # Phase 3: every area is implemented, so nothing is UNKNOWN any more.
     assert "UNKNOWN" not in out
+
+
+@pytest.mark.parametrize(
+    ("current", "judgement", "verdict", "exit_code"),
+    [
+        (True, "yes", "OK", cli.EXIT_OK),
+        (False, "no", "needs-change", cli.EXIT_OK),
+        (None, "unknown", "UNKNOWN", cli.EXIT_FAIL),
+    ],
+)
+def test_updates_policy_status_for_query_and_check(
+    current: bool | None,
+    judgement: str,
+    verdict: str,
+    exit_code: int,
+    fake_exec: FakeExec,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state: dict[str, object] = {
+        "installed": True,
+        "apt_conf_current": current,
+        "apt_policy_security_only": current,
+        "apt_conf": "/etc/apt/apt.conf.d/51-lhm",
+    }
+    reason = "private apt-daily runtime unverified; retry as root"
+    if current is None:
+        state["apt_policy_error"] = reason
+    monkeypatch.setattr(cli.updates_module, "inspect", lambda _runner: state)
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+
+    assert cli.main(["query", "updates"]) == cli.EXIT_OK
+    text = capsys.readouterr().out
+    policy_row = next(line for line in text.splitlines() if line.startswith("effective security"))
+    assert policy_row.split()[-1] == judgement
+    if current is None:
+        assert reason in text
+    assert cli.main(["query", "updates", "--json"]) == cli.EXIT_OK
+    query = json.loads(capsys.readouterr().out)
+    assert query["apt_conf_current"] is current
+    assert query["apt_policy_security_only"] is current
+    if current is None:
+        assert cli.main(["query", "all", "--json"]) == cli.EXIT_OK
+        assert json.loads(capsys.readouterr().out)["updates"] == query
+
+    assert cli.main(["check"]) == exit_code
+    updates_row = next(
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("updates ")
+    )
+    assert updates_row.split()[1] == verdict
+    assert cli.main(["check", "--json"]) == exit_code
+    results = json.loads(capsys.readouterr().out)
+    row = next(row for row in results if row["area"] == "updates")
+    assert row["state"] == verdict
+    if current is None:
+        assert row["detail"] == reason
 
 
 def test_rollback_dry_run_needs_no_root(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -225,6 +370,58 @@ def test_rollback_rejects_unmanaged_and_symlink_paths(
     assert not (outside / "config.bak.1").exists()
 
 
+@pytest.mark.parametrize(
+    ("module", "attribute", "recovery"),
+    [
+        ("caddy", "CADDYFILE", "lhm apply caddy --site"),
+        ("caddy", "INSTALL_HOLD", "lhm apply caddy --site"),
+        ("fail2ban", "JAIL_DROPIN", "rerun lhm apply fail2ban with the original settings"),
+        ("fail2ban", "CADDY_FILTER", "rerun lhm apply fail2ban with the original settings"),
+        ("fail2ban", "CADDY_ACCESS_FILTER", "rerun lhm apply fail2ban with the original settings"),
+    ],
+)
+def test_rollback_cannot_restore_old_caddy_policy_via_managed_paths_or_aliases(
+    module: str,
+    attribute: str,
+    recovery: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = tmp_path / "managed.conf"
+    old = tmp_path / "managed.conf.bak"
+    target.write_text("# direct access revoked\n", encoding="utf-8")
+    old_permit = "[caddy-lhm-access]\nenabled = true\n"
+    old.write_text(old_permit, encoding="utf-8")
+    alias = tmp_path / "alias.conf"
+    alias.symlink_to(target)
+    monkeypatch.setattr(f"lhm.modules.{module}.{attribute}", target)
+    monkeypatch.setattr(cli.sysctl_module, "SYSCTL_DROPIN", alias)
+    monkeypatch.setattr(cli, "is_root", lambda: True)
+    confirm = Mock(return_value=True)
+    monkeypatch.setattr(cli, "confirm_once", confirm)
+
+    for flags in ([], ["--dry-run"]):
+        assert cli.main(["rollback", str(target), *flags]) == cli.EXIT_USAGE
+        error = capsys.readouterr().err
+        assert recovery in error
+        if module == "fail2ban":
+            assert "inspect with lhm query fail2ban" in error
+            assert "lhm apply fail2ban --caddy-revoke-direct" not in error
+            assert (
+                "Use --caddy-revoke-direct only to intentionally remove the direct file jail."
+                in error
+            )
+        assert cli.main(["rollback", f"{tmp_path}/./{target.name}", *flags]) == cli.EXIT_USAGE
+        assert cli.main(["rollback", str(alias), *flags]) == cli.EXIT_USAGE
+        assert cli.main(["rollback", str(old), *flags]) == cli.EXIT_USAGE
+
+    confirm.assert_not_called()
+    assert target.read_text(encoding="utf-8") == "# direct access revoked\n"
+    assert old.read_text(encoding="utf-8") == old_permit
+    assert not (tmp_path / "managed.conf.bak.1").exists()
+
+
 def test_rollback_managed_file_without_backup_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -297,13 +494,35 @@ def test_apply_ssh_hardening_dry_run_prints_banner_and_port(
     from lhm.modules import ssh
 
     monkeypatch.setattr(ssh, "SSHD_DROPIN", tmp_path / "99-lhm.conf")
+    uid = tmp_path.stat().st_uid or 1
+    account = ssh.userkeys.Account("ops", uid, tmp_path.stat().st_gid or 1, tmp_path)
+    monkeypatch.setattr(ssh, "_permission_account", lambda *args, **kwargs: account)
     monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
     assert cli.main(["apply", "ssh-hardening", "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert out.splitlines()[0] == "dry-run: no changes will be made"
     assert "Port 22345" in out
+    assert "SSH permissions account: ops" in out
     assert "key validation deferred until live apply" in out
     assert fake_exec.calls == []
+
+
+def test_apply_ssh_hardening_forwards_ssh_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    run_module = Mock(return_value=cli.EXIT_OK)
+    monkeypatch.setattr(cli, "_run_module", run_module)
+    runner = Runner(dry_run=True)
+    monkeypatch.setattr(cli, "Runner", lambda **_kwargs: runner)
+    args = ["apply", "ssh-hardening", "--ssh-user", "ops", "--allow-user", "audit", "--dry-run"]
+    assert cli.main(args) == cli.EXIT_OK
+    run_module.assert_called_once_with(
+        "ssh",
+        runner,
+        False,
+        command="ssh-hardening",
+        port=22345,
+        allow_users=["audit"],
+        ssh_user="ops",
+    )
 
 
 @pytest.mark.parametrize(
@@ -487,6 +706,58 @@ def test_apply_fail2ban_dry_run(fake_exec: Any, monkeypatch: pytest.MonkeyPatch)
     assert fake_exec.calls == []
 
 
+@pytest.mark.parametrize(
+    ("flags", "direct", "paths", "revoke"),
+    [
+        (
+            [
+                "--caddy-direct",
+                "--caddy-protected-path",
+                "/admin",
+                "--caddy-protected-path",
+                "/ops",
+            ],
+            True,
+            ("/admin", "/ops"),
+            False,
+        ),
+        (["--caddy-revoke-direct"], False, (), True),
+    ],
+)
+def test_apply_fail2ban_forwards_caddy_topology_options(
+    flags: list[str],
+    direct: bool,
+    paths: tuple[str, ...],
+    revoke: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_module = Mock(return_value=cli.EXIT_OK)
+    monkeypatch.setattr(cli, "_run_module", run_module)
+    assert cli.main(["apply", "fail2ban", "--dry-run", *flags]) == cli.EXIT_OK
+    run_module.assert_called_once()
+    assert run_module.call_args.args[0] == "fail2ban"
+    assert run_module.call_args.kwargs == {
+        "bantime": cli.fail2ban_module.SSHD_BANTIME,
+        "findtime": "30m",
+        "maxretry": "3",
+        "caddy": False,
+        "caddy_maxretry": cli.fail2ban_module.CADDY_MAXRETRY,
+        "caddy_direct": direct,
+        "caddy_protected_paths": paths,
+        "caddy_revoke_direct": revoke,
+    }
+
+
+def test_apply_fail2ban_rejects_nonliteral_caddy_path(
+    fake_exec: FakeExec, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    args = ["apply", "fail2ban", "--dry-run", "--caddy-direct", "--caddy-protected-path", "/admin*"]
+    assert cli.main(args) == cli.EXIT_FAIL
+    assert "expected 1–32 literal protected paths" in capsys.readouterr().out
+    assert fake_exec.calls == []
+
+
 def test_apply_cleanup_services_dry_run(
     fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -515,7 +786,9 @@ def test_check_reports_new_modules(
 ) -> None:
     from lhm.modules import updates
 
-    monkeypatch.setattr(updates, "APT_CONF", Path("/nonexistent/51-lhm"))
+    monkeypatch.setattr(
+        updates, "inspect", lambda _runner: {"installed": True, "apt_conf_current": True}
+    )
     monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
     assert cli.main(["check"]) == 0
     out = capsys.readouterr().out
@@ -573,6 +846,7 @@ def test_query_all_prints_sections_with_separators(
         "sysctl",
         "audit",
         "updates",
+        "caddy",
     ):
         assert f"== {name} ==" in out
     assert out.index("== system ==") < out.index("== updates ==")
@@ -581,11 +855,30 @@ def test_query_all_prints_sections_with_separators(
 
 
 def test_query_all_json_emits_pure_json(
-    fake_exec: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    fake_exec: FakeExec,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    import json
+    from lhm.modules import caddy
 
+    monkeypatch.setattr(caddy, "CADDYFILE", tmp_path / "Caddyfile")
+    monkeypatch.setattr(caddy, "INSTALL_HOLD", tmp_path / "caddy-install-hold.conf")
+    fake_exec.responses.extend(
+        [
+            ("dpkg-query -W -f=${Status} caddy", 1, "", "no packages found matching caddy"),
+            ("systemctl is-active caddy.service", 4, "unknown\n", ""),
+            (
+                "systemctl is-enabled caddy.service",
+                4,
+                "",
+                "Unit file caddy.service does not exist.",
+            ),
+        ]
+    )
     monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    assert cli.main(["query", "system", "--json"]) == cli.EXIT_OK
+    system = json.loads(capsys.readouterr().out)
     assert cli.main(["query", "all", "--json"]) == 0
     data = json.loads(capsys.readouterr().out)
     assert set(data) == {
@@ -598,7 +891,15 @@ def test_query_all_json_emits_pure_json(
         "sysctl",
         "audit",
         "updates",
+        "caddy",
     }
+    assert data["caddy"]["installed"] is False
+    assert data["caddy"]["config_present"] is False
+    assert data["caddy"]["managed"] is False
+    for key in ("hostname", "distro", "kernel", "arch", "python", "user", "root"):
+        assert data["system"][key] == system[key]
+    assert "public_ip" not in data["system"]["network"]
+    assert all(cmd[0] != "curl" for cmd in fake_exec.calls)
 
 
 def test_query_ssh_with_effective_config_shows_values(
@@ -696,7 +997,7 @@ def test_color_always_overrides_no_tty_and_no_color(
     assert cli.main(["query", "system", "--color=always"]) == 0
     # system has no judged cells, so force a check run instead: still no codes...
     capsys.readouterr()
-    assert cli.main(["check", "--color=always"]) == 0
+    assert cli.main(["check", "--color=always"]) == cli.EXIT_FAIL
     assert "\033[" in capsys.readouterr().out
 
 
@@ -705,7 +1006,7 @@ def test_color_never_on_a_tty(
 ) -> None:
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
     monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
-    assert cli.main(["check", "--color=never"]) == 0
+    assert cli.main(["check", "--color=never"]) == cli.EXIT_FAIL
     assert "\033[" not in capsys.readouterr().out
 
 
@@ -788,6 +1089,48 @@ def test_query_fail2ban_judges_targets(
     assert data["sshd_bantime_increment"] is True
     assert data["legacy_jail_local_present"] is False
     assert data["caddy_enabled"] is None  # drop-in absent -> not configured
+
+
+@pytest.mark.parametrize(
+    ("mode", "live"),
+    [("file", True), ("file", False), ("file", None), ("journald", True), ("off", None)],
+)
+def test_query_fail2ban_reports_the_configured_caddy_jail(
+    mode: Literal["file", "journald", "off"],
+    live: bool | None,
+    fake_exec: FakeExec,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    from lhm.modules import fail2ban
+
+    dropin = tmp_path / "99-lhm.local"
+    direct = fail2ban.DirectAccess("a" * 64, ("/admin",), "b" * 32) if mode == "file" else None
+    dropin.write_text(fail2ban.desired_conf(caddy_mode=mode, direct=direct), encoding="utf-8")
+    monkeypatch.setattr(fail2ban, "JAIL_DROPIN", dropin)
+    monkeypatch.setattr(fail2ban, "CADDY_FILTER", tmp_path / "caddy-lhm.conf")
+    monkeypatch.setattr(fail2ban, "CADDY_ACCESS_FILTER", tmp_path / "caddy-lhm-access.conf")
+    monkeypatch.setattr(fail2ban, "LEGACY_JAIL_LOCAL", tmp_path / "jail.local")
+    monkeypatch.setattr(fail2ban, "DBFILE", tmp_path / "fail2ban.sqlite3")
+    monkeypatch.setattr(cli, "Runner", _runner_factory(fake_exec))
+    jail = direct.jail if direct else "caddy" if mode == "journald" else None
+    expected = [["fail2ban-client", "status", jail]] if jail is not None else []
+    if jail is not None:
+        status = f"fail2ban-client status {jail}"
+        if live is True:
+            fake_exec.responses.append((status, 0, f"Status for the jail: {jail}\n", ""))
+        elif live is False:
+            fake_exec.responses.append((status, 1, "", f"The jail '{jail}' does not exist"))
+        else:
+            fake_exec.responses.append((status, 1, "", "Could not access socket"))
+
+    assert cli.main(["query", "fail2ban", "--json"]) == cli.EXIT_OK
+    data = json.loads(capsys.readouterr().out)
+    assert data["caddy_mode"] == mode
+    assert data["caddy_jail"] == jail
+    assert data["caddy_jail_live"] is live
+    assert [cmd for cmd in fake_exec.calls if cmd[:2] == ["fail2ban-client", "status"]] == expected
 
 
 def test_apply_abort_by_user_answer_exits_3(

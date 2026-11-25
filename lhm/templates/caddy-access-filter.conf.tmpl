@@ -1,0 +1,13 @@
+# ===== lhm-managed fail2ban file filter for Caddy =====
+[Definition]
+# Strip just the epoch part of the canonical JSON ts field, not any request data.
+datepattern = ^\{"level":"(?:info|error)","ts":({EPOCH}(?:\d{0,3}|\.\d{1,2}))(?=,)
+
+# Match the socket peer from Caddy's fixed request prefix, not client_ip or headers.
+# Parse the intervening JSON strings/objects so an escaped URL or header cannot
+# impersonate the request URI or the root-level status.
+_string = "(?:[^"\\]|\\.)*"
+_scalar = (?:%(_string)s|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)
+_headers = \{(?:%(_string)s:\[(?:%(_string)s(?:,%(_string)s)*)?\](?:,|(?=\})))*\}
+_tls = \{(?:%(_string)s:%(_scalar)s(?:,|(?=\})))*\}
+failregex = ^\{"level":"(?:info|error)","ts":,"logger":"http\.log\.access(?:\.[a-zA-Z0-9_.-]+)?","msg":"handled request","request":\{"remote_ip":"<ADDR>"(?:,%(_string)s:%(_scalar)s)*,"uri":"(?:${protected_paths})(?:\?(?:[^"\\]|\\.)*)?","headers":%(_headers)s(?:,"transfer_encoding":\[(?:%(_string)s(?:,%(_string)s)*)?\])?(?:,"tls":%(_tls)s)?\}(?:,"bytes_read":\d+)?,"user_id":%(_string)s,"duration":%(_scalar)s,"size":\d+,"status":401,"resp_headers":%(_headers)s\}$$

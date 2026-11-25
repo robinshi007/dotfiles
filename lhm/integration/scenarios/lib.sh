@@ -50,7 +50,7 @@ expect_lhm_ok() {
     assert_eq "$LHM_RC" 0 "$1 (exit 0)"
 }
 
-# --- SSH watchdog (02 and 08) ------------------------------------------------
+# --- SSH watchdog (02, 03 and 08) --------------------------------------------
 require_ssh_test_container() {
     if [[ ${container:-} != docker || ! -f /.dockerenv ||
           ! -d /run/systemd/system || $EUID != 0 ]]; then
@@ -73,7 +73,8 @@ setup_ssh_test_client() {
     install -m 0440 /dev/null /etc/sudoers.d/lhm-integration || return 1
     cat > /etc/sudoers.d/lhm-integration <<'EOF' || return 1
 Defaults:deploy env_keep += "SSH_CONNECTION LHM_CONFIRM_BYPASS"
-deploy ALL=(root) NOPASSWD: /usr/local/bin/lhm apply ssh-hardening, /usr/local/bin/lhm ssh-confirm *
+deploy ALL=(root) NOPASSWD: /usr/local/bin/lhm apply ssh-hardening, \
+    /usr/local/bin/lhm apply ssh-hardening --ssh-user deploy, /usr/local/bin/lhm ssh-confirm *
 EOF
     visudo -cf /etc/sudoers.d/lhm-integration
 }
@@ -90,7 +91,7 @@ run_ssh_lhm() {
 }
 
 apply_ssh_pending() {
-    run_ssh_lhm 22 y apply ssh-hardening
+    run_ssh_lhm 22 y apply ssh-hardening "$@"
     if [[ $LHM_RC != 0 ]]; then
         fail "apply ssh-hardening did not reach pending (exit $LHM_RC)"
         return 1

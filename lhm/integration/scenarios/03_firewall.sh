@@ -4,13 +4,15 @@
 # and rule ordering only. It deliberately does not test host connectivity.
 . /opt/scenarios/lib.sh
 
+require_ssh_test_container
 # SSH must already be hardened (the module probes live listeners); a fresh
 # container has sshd on 22, which lhm must keep open as well as 22345.
 ssh-keygen -q -t ed25519 -N '' -f /root/deploy
 run_lhm apply ssh-user deploy --key /root/deploy.pub
 expect_lhm_ok "apply ssh-user deploy (precondition)"
-run_lhm apply ssh-hardening
-expect_lhm_ok "apply ssh-hardening (precondition)"
+setup_ssh_test_client || { fail "configure the SSH test client and sudo"; finish; }
+apply_ssh_pending --ssh-user deploy || finish
+confirm_ssh_pending || finish
 
 run_lhm apply firewall
 expect_lhm_ok "apply firewall"

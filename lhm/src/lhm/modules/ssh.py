@@ -3,7 +3,9 @@
 import base64
 import binascii
 import errno
+import hashlib
 import os
+import pwd
 import re
 import stat
 import struct
@@ -29,7 +31,7 @@ from lhm.core.files import (
 from lhm.core.mutations import mutations_allowed
 from lhm.core.report import Status, StepResult
 from lhm.core.runner import CommandError, Runner
-from lhm.modules import ssh_auth, ssh_session, ssh_watchdog
+from lhm.modules import ssh_auth, ssh_permissions, ssh_session, ssh_watchdog
 
 TEMPLATE = "ssh-hardening.conf.tmpl"
 # First shipped layout, before the explicit authentication and key-path settings.
@@ -46,6 +48,33 @@ X11Forwarding no
 AllowAgentForwarding no
 AllowTcpForwarding no
 MaxAuthTries 3
+MaxSessions 4
+ClientAliveInterval 300
+ClientAliveCountMax 2
+LoginGraceTime 30
+AllowUsers {allow_users}
+"""
+# Shipped layout before the deprecated keyboard-interactive alias was removed.
+_LEGACY_ALIAS_TEMPLATE = """# ===== lhm ssh hardening drop-in =====
+# Managed by lhm. Remove this file to revert. sshd_config.d drop-ins take
+# precedence over the main sshd_config (first obtained value wins).
+# Supported OpenSSH versions only use SSHv2; this legacy directive is ignored.
+Protocol 2
+Port {port}
+PermitRootLogin no
+PasswordAuthentication no
+PermitEmptyPasswords no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+# Use one explicit path so the effective-config probe can verify it unambiguously.
+AuthorizedKeysFile .ssh/authorized_keys
+AuthenticationMethods publickey
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+MaxAuthTries 3
+MaxStartups 3:50:10
 MaxSessions 4
 ClientAliveInterval 300
 ClientAliveCountMax 2
@@ -234,7 +263,9 @@ def _parse_pubkey(text: str) -> str:
     raise SshError("refusing: --key contains no public key")
 
 
-def _sudo_invoker(runner: Runner, *, operation: str = "--key") -> userkeys.Account | None:
+def _sudo_invoker(
+    runner: Runner, *, operation: str = "--key", dry_run: bool = False
+) -> userkeys.Account | None:
     name = os.environ.get("SUDO_USER")
     uid = os.environ.get("SUDO_UID")
     gid = os.environ.get("SUDO_GID")
@@ -244,9 +275,50 @@ def _sudo_invoker(runner: Runner, *, operation: str = "--key") -> userkeys.Accou
         re.fullmatch(r"[0-9]{1,10}", value) for value in (uid, gid)
     ):
         raise SshError(f"refusing {operation}: incomplete or invalid sudo invoker identity")
-    account = userkeys.lookup_account(runner, name)
+    account = _lookup_permission_account(runner, name, dry_run=dry_run)
     if account is None or (account.uid, account.gid) != (int(uid), int(gid)):
         raise SshError(f"refusing {operation}: sudo invoker does not match its passwd record")
+    return account
+
+
+def _lookup_permission_account(
+    runner: Runner, name: str, *, dry_run: bool
+) -> userkeys.Account | None:
+    if not dry_run:
+        return userkeys.lookup_account(runner, name)
+    # Runner does not execute even read-only commands in dry-run. Read NSS
+    # directly without enabling any Runner or filesystem mutation.
+    try:
+        record = pwd.getpwnam(name)
+    except KeyError:
+        return None
+    if record.pw_name != name:
+        raise SshError("NSS account identity mismatch")
+    return userkeys.Account(name, record.pw_uid, record.pw_gid, Path(record.pw_dir))
+
+
+def _permission_account(runner: Runner, name: str | None, *, dry_run: bool) -> userkeys.Account:
+    if name is not None:
+        if name == "root" or not USER_RE.fullmatch(name):
+            raise SshError("--ssh-user must name a valid non-root account")
+        account = _lookup_permission_account(runner, name, dry_run=dry_run)
+    elif geteuid() == 0:
+        account = _sudo_invoker(runner, operation="ssh-hardening", dry_run=dry_run)
+        if account is None:
+            raise SshError("ambiguous root invocation; specify --ssh-user NAME")
+    else:
+        uid = os.getuid()
+        try:
+            name = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            raise SshError("invoking UID has no NSS account; specify --ssh-user NAME") from None
+        account = _lookup_permission_account(runner, name, dry_run=dry_run)
+        if account is None or account.uid != uid:
+            raise SshError("invoking UID does not match its NSS record")
+    if account is None:
+        raise SshError(f"--ssh-user account not found: {name}")
+    if account.name == "root" or account.home.is_relative_to("/root"):
+        raise SshError("refusing to target root or its home")
     return account
 
 
@@ -313,19 +385,40 @@ def _import_pubkey(runner: Runner, path: str) -> str:
     return _parse_pubkey(text)
 
 
-def _has_login_key(runner: Runner, account: userkeys.Account) -> bool:
+def _has_login_key(runner: Runner, account: userkeys.Account, *, prospective: bool = False) -> bool:
     state = userkeys.probe_keys(runner, account)
     return (
-        state.ssh_ready
-        and state.keys_mode is not None
-        and (state.keys_mode & 0o400) != 0
-        and (state.keys_mode & 0o022) == 0
+        state.keys_mode is not None
+        and (
+            prospective
+            or (state.ssh_ready and state.keys_mode & 0o400 != 0 and state.keys_mode & 0o022 == 0)
+        )
         and any(is_pubkey_line(line) for line in (state.content or "").split("\n"))
     )
 
 
+def _admin_key_digests(runner: Runner, accounts: Sequence[userkeys.Account]) -> dict[str, str]:
+    digests = {}
+    for account in accounts:
+        state = userkeys.probe_keys(runner, account)
+        text = state.content or ""
+        if (
+            not state.ssh_ready
+            or state.keys_mode is None
+            or state.keys_mode & 0o422 != 0o400
+            or not any(is_pubkey_line(line) for line in text.split("\n"))
+        ):
+            raise SshError(f"refusing {account.name}: no valid authorized_keys after chmod")
+        digests[account.name] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return digests
+
+
 def _require_account_key(
-    runner: Runner, name: str, *, expected: userkeys.Account | None = None
+    runner: Runner,
+    name: str,
+    *,
+    expected: userkeys.Account | None = None,
+    prospective: bool = False,
 ) -> userkeys.Account:
     try:
         account = userkeys.lookup_account(runner, name)
@@ -333,14 +426,16 @@ def _require_account_key(
             raise SshError("account identity changed")
         if account is None:
             raise SshError("account not found")
-        if not _has_login_key(runner, account):
+        if not _has_login_key(runner, account, prospective=prospective):
             raise SshError("no valid authorized_keys in a private .ssh directory")
     except (SshError, userkeys.UserKeysError) as exc:
         raise SshError(f"refusing {name}: {exc} (run apply ssh-user first)") from exc
     return account
 
 
-def _accounts_with_keys(runner: Runner) -> list[userkeys.Account]:
+def _accounts_with_keys(
+    runner: Runner, *, permissions: ssh_permissions.Plan | None = None
+) -> list[userkeys.Account]:
     """Discover passwd accounts at nonsymlink direct children of HOME_ROOT."""
     try:
         with os.scandir(HOME_ROOT) as entries:
@@ -355,7 +450,12 @@ def _accounts_with_keys(runner: Runner) -> list[userkeys.Account]:
     for name in candidates:
         try:
             account = userkeys.lookup_account(runner, name)
-            if account and account.home == HOME_ROOT / name and _has_login_key(runner, account):
+            planned = bool(permissions and permissions.changes and account == permissions.account)
+            if (
+                account
+                and account.home == HOME_ROOT / name
+                and _has_login_key(runner, account, prospective=planned)
+            ):
                 accounts.append(account)
         except userkeys.UserKeysError:
             continue
@@ -385,6 +485,7 @@ def _managed_allow_users(snapshot: bytes) -> list[str]:
             if text in (
                 desired_conf(port, names),
                 _LEGACY_TEMPLATE.format(port=port, allow_users=" ".join(names)),
+                _LEGACY_ALIAS_TEMPLATE.format(port=port, allow_users=" ".join(names)),
             ):
                 return names
     raise SshError(f"refusing to overwrite unrecognized SSH drop-in: {SSHD_DROPIN}")
@@ -419,7 +520,7 @@ def apply_user(runner: Runner, *, user: str, key_file: str, sudo: bool = False) 
 
     create_step = f"create user {user}"
     sudo_step = f"add {user} to sudo"
-    if runner.dry_run:
+    if runner.dry_run or not mutations_allowed():
         print("Plan (ssh-user): account and --key validation deferred until live apply")
         results = [
             StepResult(create_step, Status.PLANNED, "if missing"),
@@ -447,8 +548,19 @@ def apply_user(runner: Runner, *, user: str, key_file: str, sudo: bool = False) 
         plan.append(f"  - add {user} to the sudo group after key verification")
     if not confirm_once(plan):
         return [StepResult("ssh-user", Status.ABORTED, "aborted; no changes made")]
+    try:
+        with locked_target(SSHD_DROPIN):
+            _require_no_watchdog(runner, reject_prepared=True)
+            return _apply_confirmed_user(runner, user, key_line, prior, sudo=sudo)
+    except (OSError, ValueError) as exc:
+        return [StepResult("ssh-user", Status.FAIL, str(exc))]
 
+
+def _apply_confirmed_user(
+    runner: Runner, user: str, key_line: str, prior: userkeys.Account | None, *, sudo: bool
+) -> list[StepResult]:
     results: list[StepResult] = []
+    create_step = f"create user {user}"
     step = create_step
     try:
         if prior is None:
@@ -473,7 +585,7 @@ def apply_user(runner: Runner, *, user: str, key_file: str, sudo: bool = False) 
         step = "verify"
         _verify_installed_key(runner, account, key_line)
         if sudo:
-            step = sudo_step
+            step = f"add {user} to sudo"
             query = ["id", "-nG", user]
             groups = _account_command(runner, query, "sudo membership check").split()
             if "sudo" in groups:
@@ -1331,6 +1443,9 @@ class _RecoveryState:
     write_attempted: bool
     action: str
     fallback_attempted: bool
+    permissions: ssh_permissions.Recovery | None
+    permission_operations: tuple[ssh_permissions.Operation, ...]
+    admin_key_digests: dict[str, str] | None
 
 
 def _recovery_state(data: dict[str, object]) -> _RecoveryState:
@@ -1338,7 +1453,14 @@ def _recovery_state(data: dict[str, object]) -> _RecoveryState:
         return SshError("invalid SSH watchdog recovery manifest")
 
     # Session freshness is only required for confirmation, never for rollback.
-    if data.keys() - {"freshness", "fallback_attempted"} != {
+    optional = {
+        "freshness",
+        "fallback_attempted",
+        "permissions",
+        "permission_operations",
+        "admin_key_digests",
+    }
+    if data.keys() - optional != {
         "snapshot",
         "candidate",
         "backup",
@@ -1356,13 +1478,26 @@ def _recovery_state(data: dict[str, object]) -> _RecoveryState:
         raise invalid()
     snapshot = None if data["snapshot"] is None else _manifest_bytes(data["snapshot"])
     candidate = _manifest_bytes(data["candidate"])
+    permissions = (
+        ssh_permissions.Recovery.parse(data["permissions"]) if "permissions" in data else None
+    )
+    permission_operations = (
+        permissions.operations(data.get("permission_operations", [])) if permissions else ()
+    )
     backup_name, write_attempted, action = data["backup"], data["write_attempted"], data["action"]
     unit, service_state = data["unit"], data["service_state"]
     socket, socket_state = data["socket"], data["socket_state"]
     port = data["port"]
     if (
         not candidate
-        or candidate == snapshot
+        or (candidate == snapshot and (permissions is None or write_attempted))
+        or ("permission_operations" in data and permissions is None)
+        or (
+            permissions is not None
+            and write_attempted
+            and tuple(op.index for op in permission_operations if op.after is not None)
+            != permissions.changed_indices
+        )
         or not isinstance(write_attempted, bool)
         or type(port) is not int
         or not 1 <= port <= 65535
@@ -1448,6 +1583,17 @@ def _recovery_state(data: dict[str, object]) -> _RecoveryState:
         accounts.append(userkeys.Account(name, uid, gid, Path(home)))
         names.add(name)
     raw_connection = data["connection"]
+    digests = data.get("admin_key_digests")
+    if "admin_key_digests" in data and (
+        permissions is None
+        or not isinstance(digests, dict)
+        or digests.keys() != names
+        or any(
+            not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            for digest in digests.values()
+        )
+    ):
+        raise invalid()
     if raw_connection is not None and not isinstance(raw_connection, str):
         raise invalid()
     connection = ssh_auth.parse_ssh_connection(raw_connection)
@@ -1467,11 +1613,77 @@ def _recovery_state(data: dict[str, object]) -> _RecoveryState:
         write_attempted,
         action,
         fallback_attempted,
+        permissions,
+        permission_operations,
+        digests,
     )
 
 
+def _verify_modes(
+    runner: Runner, state: _RecoveryState, *, confirm: bool, manual: bool = False
+) -> None:
+    permissions = state.permissions
+    operations = state.permission_operations
+    if permissions is None:
+        return
+    if confirm and tuple(op.index for op in operations) != permissions.changed_indices:
+        raise SshError("SSH permission hardening did not finish all planned changes")
+    account = permissions.account
+    if userkeys.lookup_account(runner, account.name, timeout=2) != account:
+        raise SshError("SSH permission account identity changed; left untouched")
+    with ssh_permissions.inspect(account) as plan:
+        permissions.check(plan, operations, confirm=confirm, manual=manual)
+
+
+def _recover_modes(
+    runner: Runner,
+    pending: ssh_watchdog.Pending,
+    state: _RecoveryState,
+    results: list[StepResult],
+    *,
+    manual: bool,
+) -> int:
+    permissions = state.permissions
+    if permissions is None or not state.permission_operations:
+        return 0
+    try:
+        _verify_modes(runner, state, confirm=False, manual=manual)
+    except (OSError, ValueError, userkeys.UserKeysError) as exc:
+        error = exc.__cause__ if isinstance(exc, userkeys.UserKeysError) else exc
+        if isinstance(error, Exception) and ssh_permissions.retryable(error):
+            results.append(StepResult("restore SSH permissions", Status.FAIL, str(exc)))
+            return _RETRY
+        _report_manual_modes(pending, state, results, str(exc))
+        return 1
+    results.append(StepResult("restore SSH permissions", Status.OK, "original modes verified"))
+    return 0
+
+
+def _report_manual_modes(
+    pending: ssh_watchdog.Pending,
+    state: _RecoveryState,
+    results: list[StepResult],
+    reason: str,
+) -> None:
+    if state.permissions is None or not state.permission_operations:
+        return
+    recovery = state.permissions.console_plan(state.permission_operations)
+    detail = (
+        f"{reason}; no automatic chmod. From an independent console, stop other key writers, "
+        "verify each recorded inode/owner and its safe contents before restoring its "
+        f"reviewed old mode (do not chmod a replacement): {recovery}. "
+        "Leave /run/lhm-ssh-rollback/pending.json intact; "
+        f"{_watchdog_recovery_instructions(pending.id)}"
+    )
+    results.append(StepResult("restore SSH permissions", Status.FAIL, detail))
+
+
 def _recover_watchdog(
-    runner: Runner, pending: ssh_watchdog.Pending, results: list[StepResult]
+    runner: Runner,
+    pending: ssh_watchdog.Pending,
+    results: list[StepResult],
+    *,
+    manual_permissions: bool = False,
 ) -> int:
     state = _recovery_state(pending.data)
     if pending.phase == "prepared":
@@ -1480,7 +1692,19 @@ def _recover_watchdog(
         pending = ssh_watchdog.update(pending, phase="failed")
 
     if not state.write_attempted:
-        _dropin_snapshot(require_trusted=True)
+        if state.permission_operations:
+            try:
+                _require_original_dropin(state.snapshot)
+            except (OSError, SshError) as exc:
+                _report_manual_modes(pending, state, results, str(exc))
+                return _RETRY if _retryable_recovery_error(exc) else 1
+            modes_status = _recover_modes(
+                runner, pending, state, results, manual=manual_permissions
+            )
+            if modes_status:
+                return modes_status
+        else:
+            _dropin_snapshot(require_trusted=True)
         ssh_watchdog.clear(runner, pending)
         return 0
 
@@ -1499,6 +1723,7 @@ def _recover_watchdog(
         if isinstance(exc, KeyboardInterrupt):
             raise
         if not _retryable_recovery_error(exc):
+            _report_manual_modes(pending, state, results, "SSH drop-in recovery unverified")
             return 1
         disk_status = _RETRY
 
@@ -1532,11 +1757,13 @@ def _recover_watchdog(
             snapshot=state.snapshot,
             disk_restored=disk_restored,
         )
-    if runtime_status == 1:
-        return 1
-    if _RETRY in (disk_status, runtime_status):
-        return _RETRY
+    if runtime_status or disk_status:
+        _report_manual_modes(pending, state, results, "SSH recovery unverified")
+        return 1 if runtime_status == 1 else _RETRY
     _require_original_dropin(state.snapshot)
+    modes_status = _recover_modes(runner, pending, state, results, manual=manual_permissions)
+    if modes_status:
+        return modes_status
     ssh_watchdog.clear(runner, pending)
     return 0
 
@@ -1579,6 +1806,39 @@ def _failed_watchdog_detail(txid: str) -> str:
     )
 
 
+def _local_recovery_console() -> bool:
+    # A PTY cannot prove physical/out-of-band access (or absence of SSH).
+    # For acknowledgement, accept only the Linux console/VT/serial devices,
+    # not an arbitrary SSH or local-emulator pseudoterminal.
+    if any(os.environ.get(name) for name in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")):
+        return False
+    try:
+        fd = sys.stdin.fileno()
+        if os.tcgetpgrp(fd) != os.getpgrp():
+            return False
+        path = os.ttyname(fd)
+    except OSError, ValueError:
+        return False
+    return bool(re.fullmatch(r"/dev/(?:console|tty(?:S|AMA|USB)?[0-9]+|hvc[0-9]+)", path))
+
+
+def _require_chmod_maintenance(runner: Runner) -> None:
+    if (
+        _local_recovery_console()
+        and _unit_active(runner, "multi-user.target") is False
+        and (
+            _unit_active(runner, "rescue.target") is True
+            or _unit_active(runner, "emergency.target") is True
+        )
+    ):
+        return
+    raise SshError(
+        "automatic SSH chmod requires a verified local rescue/emergency console; "
+        "otherwise quiesce all key writers, inspect ownership and keys, set the modes "
+        "manually from the console, and rerun ssh-hardening --dry-run"
+    )
+
+
 def recover_failed_watchdog(runner: Runner, txid: str) -> list[StepResult]:
     """Attempt recovery once for a matching failed transaction under the shared lock."""
     step = "recover SSH watchdog"
@@ -1596,7 +1856,12 @@ def recover_failed_watchdog(runner: Runner, txid: str) -> list[StepResult]:
             if pending is None or pending.id != txid or pending.phase != "failed":
                 detail = "no matching failed SSH watchdog transaction"
                 return [StepResult(step, Status.FAIL, detail)]
-            status = _recover_watchdog(runner, pending, results)
+            permission_recovery = bool(_recovery_state(pending.data).permission_operations)
+            if permission_recovery and not _local_recovery_console():
+                raise SshError("SSH permission recovery requires a verified Linux console")
+            status = _recover_watchdog(
+                runner, pending, results, manual_permissions=permission_recovery
+            )
     except BlockingIOError:
         detail = "SSH watchdog recovery is busy (managed target is locked)"
     except (
@@ -1667,7 +1932,12 @@ def confirm_watchdog(runner: Runner, txid: str) -> list[StepResult]:
             data = pending.data
             state = _recovery_state(data)
             boot_id, cutoff_tick = _confirmation_cutoff(data)
-            if state.action != ("restart" if state.conversion is not None else "reload"):
+            action = (
+                "none"
+                if state.candidate == state.snapshot
+                else ("restart" if state.conversion is not None else "reload")
+            )
+            if state.action != action or (action == "none" and not state.permission_operations):
                 raise SshError("SSH watchdog activation was not completed")
             connection = ssh_auth.parse_ssh_connection(os.environ.get("SSH_CONNECTION"))
             if connection is None or connection == state.connection or connection[3] != state.port:
@@ -1682,6 +1952,9 @@ def confirm_watchdog(runner: Runner, txid: str) -> list[StepResult]:
             if _dropin_snapshot() != state.candidate:
                 raise SshError("SSH drop-in changed after activation")
             _require_idle_ssh_units(runner, state.unit, state.conversion)
+            _verify_modes(runner, state, confirm=True)
+            if state.permissions is not None and state.admin_key_digests is None:
+                raise SshError("missing authorized_keys content receipts")
             for account in state.accounts:
                 if not _has_login_key(runner, account):
                     raise SshError(f"{account.name}: authorized SSH key no longer verified")
@@ -1697,6 +1970,11 @@ def confirm_watchdog(runner: Runner, txid: str) -> list[StepResult]:
             _require_idle_ssh_units(runner, state.unit, state.conversion)
             if _dropin_snapshot() != state.candidate:
                 raise SshError("SSH drop-in changed during confirmation")
+            if state.admin_key_digests is not None and (
+                _admin_key_digests(runner, state.accounts) != state.admin_key_digests
+            ):
+                raise SshError("administrator authorized_keys contents changed")
+            _verify_modes(runner, state, confirm=True)
             if ssh_watchdog.current() != pending:
                 raise SshError("SSH watchdog transaction changed during confirmation")
             _require_watchdog_time(pending)
@@ -1707,17 +1985,19 @@ def confirm_watchdog(runner: Runner, txid: str) -> list[StepResult]:
 
 
 def _require_inert_prepared(state: _RecoveryState) -> None:
-    if state.write_attempted:
+    if state.write_attempted or state.permission_operations:
         raise SshError("prepared SSH watchdog unexpectedly recorded an attempted write")
 
 
-def _require_no_watchdog(runner: Runner, *, clear_prepared: bool = False) -> None:
+def _require_no_watchdog(
+    runner: Runner, *, clear_prepared: bool = False, reject_prepared: bool = False
+) -> None:
     pending = ssh_watchdog.current()
     if pending is None:
         return
     if pending.phase == "failed":
         raise SshError(_failed_watchdog_detail(pending.id))
-    if pending.phase == "prepared":
+    if pending.phase == "prepared" and not reject_prepared:
         # The lock excludes a live arming operation. A crashed arm may never
         # have scheduled a timer, and cannot have made any SSH changes yet.
         _require_inert_prepared(_recovery_state(pending.data))
@@ -1728,7 +2008,11 @@ def _require_no_watchdog(runner: Runner, *, clear_prepared: bool = False) -> Non
 
 
 def apply_hardening(
-    runner: Runner, *, port: int = DEFAULT_PORT, allow_users: Sequence[str] = ()
+    runner: Runner,
+    *,
+    port: int = DEFAULT_PORT,
+    allow_users: Sequence[str] = (),
+    ssh_user: str | None = None,
 ) -> list[StepResult]:
     if not 1 <= port <= 65535:
         return [StepResult("ssh-hardening", Status.FAIL, f"invalid port: {port}")]
@@ -1746,17 +2030,48 @@ def apply_hardening(
     requested = list(dict.fromkeys([*retained, *requested]))
 
     dry_run = runner.dry_run or not mutations_allowed()
+    try:
+        target = _permission_account(runner, ssh_user, dry_run=dry_run)
+        with ssh_permissions.inspect(target) as permissions:
+            return _plan_hardening(
+                runner, port, requested, snapshot, permissions, ssh_user=ssh_user, dry_run=dry_run
+            )
+    except (CommandError, OSError, ValueError, userkeys.UserKeysError) as exc:
+        return [StepResult("ssh-hardening", Status.FAIL, str(exc))]
+
+
+def _plan_hardening(
+    runner: Runner,
+    port: int,
+    requested: list[str],
+    snapshot: bytes | None,
+    permissions: ssh_permissions.Plan,
+    *,
+    ssh_user: str | None,
+    dry_run: bool,
+) -> list[StepResult]:
+    target = permissions.account
+    mode_changes = permissions.changes
+    permissions.require_narrowing()
     accounts: list[userkeys.Account] = []
     if dry_run:
         candidates = " ".join(requested) if requested else "discover users with valid keys"
         users_plan = f"{candidates} (key validation deferred until live apply)"
     elif requested:
         try:
-            accounts = [_require_account_key(runner, name) for name in requested]
+            accounts = [
+                _require_account_key(
+                    runner,
+                    name,
+                    expected=target if mode_changes and name == target.name else None,
+                    prospective=bool(mode_changes and name == target.name),
+                )
+                for name in requested
+            ]
         except SshError as exc:
             return [StepResult("ssh-hardening", Status.FAIL, str(exc))]
     else:
-        accounts = _accounts_with_keys(runner)
+        accounts = _accounts_with_keys(runner, permissions=permissions)
         if not accounts:
             return [
                 StepResult(
@@ -1775,7 +2090,28 @@ def apply_hardening(
     plan = [
         "Plan (ssh-hardening):",
         f"  - allowed users: {users_plan}",
+        f"  - SSH permissions account: {target.name} (NSS home: {target.home})",
     ]
+    mode_steps: list[StepResult] = []
+    ssh_dir = target.home / ".ssh"
+    for path, mode in ((ssh_dir, 0o700), (ssh_dir / "authorized_keys", 0o600)):
+        entry = next((item for item in permissions.targets if item.path == path), None)
+        if entry is None:
+            detail = "missing; not created"
+        elif entry.old_mode == mode:
+            detail = f"already {mode:04o}"
+        else:
+            detail = f"{entry.old_mode:04o} -> {mode:04o}"
+            mode_steps.append(StepResult(f"chmod {path}", Status.PLANNED, detail))
+        plan.append(f"  - {path}: {detail}")
+    if mode_changes:
+        plan.extend(
+            [
+                "  - the watchdog never widens permissions; restoring old modes is manual",
+                "  - answer y only in isolated maintenance: stop all external key writers and "
+                "keep this independent console available to restore the old modes without SSH",
+            ]
+        )
     if needed:
         plan.extend(
             [
@@ -1806,6 +2142,7 @@ def apply_hardening(
             runner.run(["sshd", "-T"])
             runner.run(["ss", "-tlnp"])
             return [
+                *mode_steps,
                 StepResult(f"write {SSHD_DROPIN}", Status.SKIPPED, "already current"),
                 StepResult("verify", Status.PLANNED, "effective config, managed keys and listener"),
             ]
@@ -1816,6 +2153,7 @@ def apply_hardening(
         runner.run(["systemctl", "restart", "--job-mode=fail", SERVICE_UNITS[0]])
         runner.run(["ss", "-tlnp"])
         return [
+            *mode_steps,
             StepResult(f"write {SSHD_DROPIN}", Status.PLANNED),
             StepResult("sshd -t", Status.PLANNED, "gate"),
             StepResult("sshd -T effective", Status.PLANNED, "gate"),
@@ -1825,18 +2163,23 @@ def apply_hardening(
         ]
 
     try:
-        if needed:
+        if needed or mode_changes:
+            if mode_changes:
+                _require_chmod_maintenance(runner)
             if SSHD_DROPIN.parent.exists():
                 with locked_target(SSHD_DROPIN):
                     _require_no_watchdog(runner)
-            if not confirm_once(plan):
+            confirmed = (
+                confirm_once(plan, allow_bypass=False) if mode_changes else confirm_once(plan)
+            )
+            if not confirmed:
                 return [StepResult("ssh-hardening", Status.ABORTED, "aborted; no changes made")]
         if needed and not SSHD_DROPIN.parent.exists():
             # Never create the managed directory before obtaining its shared lock and
             # arming recovery. Keep the original preflight diagnostics on unsupported hosts.
             _hardening_preflight(runner)
             raise SshError(f"SSH drop-in directory must already exist: {SSHD_DROPIN.parent}")
-        with locked_target(SSHD_DROPIN):
+        with locked_target(SSHD_DROPIN) as lock_fd:
             locked_snapshot = _dropin_snapshot(require_trusted=True)
             if locked_snapshot != snapshot:
                 return [
@@ -1846,17 +2189,33 @@ def apply_hardening(
                         "SSH drop-in changed during confirmation; rerun to review the new plan",
                     )
                 ]
-            if not needed:
-                _require_no_watchdog(runner, clear_prepared=True)
-                return [
-                    StepResult(f"write {SSHD_DROPIN}", Status.SKIPPED, "already current"),
-                    _verify_hardening(runner, port, accounts),
-                ]
-            for account in accounts:
-                _require_account_key(runner, account.name, expected=account)
+            if _permission_account(runner, ssh_user, dry_run=False) != target:
+                raise SshError("SSH permissions account changed; rerun to review")
+            permissions.verify_original()
+            if needed or mode_changes:
+                for account in accounts:
+                    _require_account_key(
+                        runner,
+                        account.name,
+                        expected=account,
+                        prospective=bool(mode_changes and account == target),
+                    )
             _require_no_watchdog(runner, clear_prepared=True)
-            return _apply_confirmed_hardening(runner, desired, port, accounts, locked_snapshot)
-    except (CommandError, OSError, ValueError) as exc:
+            if needed or mode_changes:
+                return _apply_confirmed_hardening(
+                    runner,
+                    desired,
+                    port,
+                    accounts,
+                    locked_snapshot,
+                    permissions=permissions,
+                    lock_fd=lock_fd,
+                )
+            return [
+                StepResult(f"write {SSHD_DROPIN}", Status.SKIPPED, "already current"),
+                _verify_hardening(runner, port, accounts),
+            ]
+    except (CommandError, OSError, ValueError, userkeys.UserKeysError) as exc:
         return [StepResult("ssh-hardening", Status.FAIL, str(exc))]
 
 
@@ -1866,6 +2225,9 @@ def _apply_confirmed_hardening(
     port: int,
     accounts: Sequence[userkeys.Account],
     snapshot: bytes | None,
+    *,
+    permissions: ssh_permissions.Plan,
+    lock_fd: int | None,
 ) -> list[StepResult]:
     results: list[StepResult] = []
     candidate = desired.encode("utf-8")
@@ -1894,6 +2256,34 @@ def _apply_confirmed_hardening(
             raise SshError("SSH backup is not beside the drop-in")
         record(write_attempted=True, backup=path.name)
 
+    operations: list[list[int | None]] = []
+
+    def record_intent(index: int, before: int) -> None:
+        operations.append([index, before, None])
+        record(permission_operations=operations)
+
+    def record_receipt(index: int, after: int) -> None:
+        if operations[-1][0] != index or operations[-1][2] is not None:
+            raise SshError("unexpected SSH chmod receipt")
+        operations[-1][2] = after
+        record(permission_operations=operations)
+
+    def complete(verification: StepResult) -> None:
+        nonlocal recover_here
+        if verification.status is Status.OK:
+            if pending is not None and permissions.changes:
+                _verify_modes(runner, _recovery_state(pending.data), confirm=True)
+            # BOOTTIME ticks identify a newer SSH transport, not the monotonic deadline.
+            boot_id, cutoff_tick = ssh_session.freshness_cutoff()
+            awaiting = record(phase="awaiting-confirm", freshness=[boot_id, cutoff_tick])
+            recover_here = False
+            results.append(
+                StepResult(
+                    "SSH watchdog", Status.CHANGED, _confirmation_instructions(awaiting, port)
+                )
+            )
+        results.append(verification)
+
     try:
         unit, service_state, conversion, previous_endpoints = _hardening_preflight(runner)
         data: dict[str, object] = {
@@ -1911,12 +2301,46 @@ def _apply_confirmed_hardening(
             "write_attempted": False,
             "action": "none",
         }
+        if permissions.changes:
+            data["permissions"] = permissions.manifest()
         _recovery_state(data)
         if _dropin_snapshot(require_trusted=True) != snapshot:
             raise SshError("SSH drop-in changed before write; rerun to review the new plan")
         pending = ssh_watchdog.arm(runner, data)
         _require_watchdog_time(pending)
         _recovery_hint(f"SSH watchdog armed: {_confirmation_instructions(pending, port)}")
+        if permissions.changes:
+            if lock_fd is None:
+                raise SshError("missing SSH transaction lock")
+            _require_chmod_maintenance(runner)
+            account = permissions.account
+            if userkeys.lookup_account(runner, account.name) != account:
+                raise SshError("SSH permissions account changed during confirmation")
+            with ssh_permissions.inspect(account) as current:
+                if current.manifest() != data["permissions"]:
+                    raise SshError("SSH permission paths or modes changed; rerun to review")
+            # The forked chmod child inherits this caller's flock until it exits.
+            permissions.apply(record_intent, record_receipt, lock_fd=lock_fd)
+            results.extend(
+                StepResult(
+                    f"chmod {entry.path}",
+                    Status.CHANGED,
+                    f"{entry.old_mode:04o} -> {entry.mode:04o}",
+                )
+                for entry in permissions.changes
+            )
+            for admin in accounts:
+                _require_account_key(runner, admin.name, expected=admin)
+            record(admin_key_digests=_admin_key_digests(runner, accounts))
+        if snapshot == candidate:
+            _require_original_dropin(snapshot)
+            _require_idle_ssh_units(runner, unit, conversion)
+            verification = _verify_hardening(runner, port, accounts, require_listener=True)
+            _require_idle_ssh_units(runner, unit, conversion)
+            _require_original_dropin(snapshot)
+            results.append(StepResult(f"write {SSHD_DROPIN}", Status.SKIPPED, "already current"))
+            complete(verification)
+            return results
         if not ensure_privsep_dir():
             raise SshError("could not prepare /run/sshd")
         if _dropin_snapshot(require_trusted=True) != snapshot:
@@ -2005,19 +2429,10 @@ def _apply_confirmed_hardening(
         action = "restarted" if conversion is not None else "reloaded"
         results.append(StepResult("reload sshd", Status.CHANGED, f"{action} {unit}"))
 
-        verification = _verify_hardening(runner, port, accounts, require_listener=True)
-        if verification.status is Status.OK:
-            # BOOTTIME ticks identify a newer SSH transport, not the watchdog
-            # deadline; expiry and confirmation still use CLOCK_MONOTONIC.
-            boot_id, cutoff_tick = ssh_session.freshness_cutoff()
-            awaiting = record(phase="awaiting-confirm", freshness=[boot_id, cutoff_tick])
-            recover_here = False
-            results.append(
-                StepResult(
-                    "SSH watchdog", Status.CHANGED, _confirmation_instructions(awaiting, port)
-                )
-            )
-        results.append(verification)
+        complete(_verify_hardening(runner, port, accounts, require_listener=True))
+    except ssh_permissions.ChmodStillRunning as exc:
+        recover_here = False
+        results.append(StepResult("ssh-hardening", Status.FAIL, str(exc)))
     except Exception as exc:
         results.append(StepResult("ssh-hardening", Status.FAIL, str(exc)))
     except KeyboardInterrupt:
@@ -2032,7 +2447,11 @@ def _apply_confirmed_hardening(
                 current = ssh_watchdog.current()
                 if current is None or current.id != pending.id:
                     raise SshError("SSH watchdog manifest disappeared during apply")
+                start = len(results)
                 _recover_watchdog(runner, current, results)
+                for result in results[start:]:
+                    if result.name == "restore SSH permissions" and result.status is Status.FAIL:
+                        _recovery_hint(result.detail)
             except Exception as exc:
                 results.append(StepResult("SSH watchdog", Status.FAIL, str(exc)))
                 _recovery_hint("SSH recovery not verified; inspect the watchdog from the console")
@@ -2095,11 +2514,12 @@ class SshModule:
         sudo: bool = False,
         port: int = DEFAULT_PORT,
         allow_users: Sequence[str] = (),
+        ssh_user: str | None = None,
     ) -> list[StepResult]:
         if command == "ssh-user":
             return apply_user(runner, user=user, key_file=key, sudo=sudo)
         if command == "ssh-hardening":
-            return apply_hardening(runner, port=port, allow_users=allow_users)
+            return apply_hardening(runner, port=port, allow_users=allow_users, ssh_user=ssh_user)
         return [
             StepResult(
                 "ssh",

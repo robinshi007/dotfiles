@@ -57,20 +57,22 @@ supported (the plan still prints, idempotency checks still run first, and
 `--dry-run` still writes nothing). It is the documented hatch for this suite
 and for root-owned unattended scripts; it is not a CLI flag. See
 [`confirm.py`](../src/lhm/core/confirm.py).
-It does not bypass `ssh-confirm`. Scenarios 02 and 08 use a pinned ephemeral
+It does not bypass `ssh-confirm`. Scenarios 02, 03, and 08 use a pinned ephemeral
 host key and a new, non-multiplexed SSH transport for confirmation on port
-22345 after applying on port 22. Both use the test account's actual sudo on a
+22345 after applying on port 22. They use the test account's actual sudo on a
 TTY to run the image's trusted `/usr/local/bin/lhm`, with one `y` for apply and
 one `y` for `ssh-confirm`. Their sudo policy is installed only inside the test
-container.
+container. These are drop-in-only changes. On a real host, keep independent
+console access and confirm from a fresh key login before applying the firewall;
+automatic SSH permission changes require a verified rescue/emergency console.
 
 ## Scenarios
 
 | # | what it proves |
 |---|----------------|
-| 01 updates | `unattended-upgrades` installed/enabled, `51-lhm` written with security-only origins |
+| 01 updates | `lhm apply updates --security-only --dry-run` plans an isolated security upgrade without an ordinary upgrade fallback or writing `51-lhm` |
 | 02 ssh | user + key, drop-in, `sshd -T` agreement, listener on 22345, **real** key login and watchdog confirmation, non-TTY bypass/wrong key/password refused |
-| 03 firewall | ufw active, default deny incoming, `22345/tcp` allowed and **first** in rule order |
+| 03 firewall | after fresh-session SSH confirmation, ufw active, default deny incoming, `22345/tcp` allowed and **first** in rule order |
 | 04 fail2ban | service active, `jail.d/99-lhm.local` written (strict sshd values, bantime.increment in `fail2ban-client -d`), legacy `jail.local` untouched by sha256, a ban really creates the nftables set; the live caddy jail is skipped (caddy is not in the image) |
 | 05 sysctl | live `kptr_restrict=2`, `dmesg_restrict=1`, `rp_filter=1`, second run is a no-op |
 | 06 audit | rules drop-in + `augenrules --check`; live audit only where the kernel allows it (see below) |
@@ -79,7 +81,7 @@ container.
 | 09 rollback | `lhm rollback` restores the original, backs the current file up first, fails closed without a backup |
 
 Each scenario is capped by `SCENARIO_TIMEOUT` seconds (default 1800); override
-for a slow mirror: `sudo SCENARIO_TIMEOUT=3600 ./run.sh`.
+for a slow VM: `sudo SCENARIO_TIMEOUT=3600 ./run.sh`.
 
 ## Optional: verify the watchdog retry
 
@@ -119,9 +121,12 @@ timer, reboot, or manually restart SSH during the test.
    exists and its hash if present, the `ssh.socket`/`ssh.service` enablement
    and active listening mode (socket or standalone), and the original port-22
    listener with `ss -ltnp`.
-2. At a root VM console, launch `lhm apply ssh-hardening` using the trusted,
-   root-controlled CLI and its Python debugger (for example, `/opt/lhm/bin/python
-   -m pdb /opt/lhm/bin/lhm apply ssh-hardening` in a root-controlled virtualenv).
+2. At a root VM console, use the trusted CLI to run
+   `/opt/lhm/bin/lhm apply ssh-hardening --ssh-user NAME --dry-run` and verify
+   that no permission changes are planned. Then launch the drop-in change in
+   its Python debugger (for example, `/opt/lhm/bin/python -m pdb
+   /opt/lhm/bin/lhm apply ssh-hardening --ssh-user NAME` in a root-controlled
+   virtualenv).
    In `pdb`, set a breakpoint in the SSH apply implementation after the
    candidate listener is verified but before apply returns, then continue
    and confirm once. At
@@ -152,8 +157,11 @@ timer, reboot, or manually restart SSH during the test.
   reports SKIPPED. Consequences for real hosts: `-e 2` (immutable) means rules
   can only be reloaded after a reboot, so a second `lhm apply audit` must be a
   no-op — that path is unit-tested, not integration-tested.
-* apt upgrade latency/network: scenario 01 really runs `apt-get upgrade`; with
-  no network or a frozen mirror the module fails and the scenario fails with it.
+* **Live APT updates.** Scenario 01 is offline and does not need the trusted APT
+  security worker. The image does not install it. Live `apply updates` requires
+  [a matching trusted worker](../README.md#provision-the-apt-security-worker)
+  and an active, enabled `apt-daily-upgrade.timer`; the suite does not test live
+  upgrades or timer integration.
 * sshd login is tested from the container to itself over loopback. It cannot
   detect a firewall or routing problem on the real path.
 * auditd's own log rotation (`/var/log/audit`) is configured but not exercised.

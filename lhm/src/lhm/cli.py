@@ -3,9 +3,6 @@
 import argparse
 import json
 import logging
-import os
-import platform
-import socket
 import sys
 from contextlib import nullcontext, redirect_stdout
 from pathlib import Path
@@ -56,6 +53,7 @@ QUERY_TARGETS = (
     "sysctl",
     "audit",
     "updates",
+    "caddy",
     "all",
 )
 
@@ -92,6 +90,12 @@ def build_parser() -> argparse.ArgumentParser:
     for target in QUERY_TARGETS:
         leaf = query_targets.add_parser(target)
         _add_global_flags(leaf, suppress=True)
+        if target == "system":
+            leaf.add_argument(
+                "--public-ip",
+                action="store_true",
+                help="contact an external service to look up the public IP (not with --dry-run)",
+            )
 
     check_parser = commands.add_parser("check", help="idempotency audit: OK / needs-change")
     _add_global_flags(check_parser, suppress=True)
@@ -144,6 +148,9 @@ def build_parser() -> argparse.ArgumentParser:
                 default=[],
                 help="add a user to the lhm-managed SSH allowlist (repeatable)",
             )
+            hardening_leaf.add_argument(
+                "--ssh-user", metavar="NAME", help="account whose SSH key permissions to tighten"
+            )
             continue
         apply_name = "cleanup-services" if module.name == "services" else module.name
         leaf = apply_targets.add_parser(apply_name, help=module.description)
@@ -166,10 +173,28 @@ def build_parser() -> argparse.ArgumentParser:
             leaf.add_argument("--bantime", default=fail2ban_module.SSHD_BANTIME)
             leaf.add_argument("--findtime", default="30m")
             leaf.add_argument("--maxretry", default="3")
-            leaf.add_argument(
+            caddy_modes = leaf.add_mutually_exclusive_group()
+            caddy_modes.add_argument(
                 "--caddy",
                 action="store_true",
                 help="also enable the caddy jail and install the caddy-lhm filter",
+            )
+            caddy_modes.add_argument(
+                "--caddy-direct",
+                action="store_true",
+                help="attest direct Caddy ingress and enable the access-log jail",
+            )
+            caddy_modes.add_argument(
+                "--caddy-revoke-direct",
+                action="store_true",
+                help="revoke the direct-ingress attestation and disable the access-log jail",
+            )
+            leaf.add_argument(
+                "--caddy-protected-path",
+                action="append",
+                default=[],
+                metavar="PATH",
+                help="literal authentication-protected path for --caddy-direct (repeatable)",
             )
             leaf.add_argument(
                 "--caddy-maxretry",
@@ -197,13 +222,19 @@ def build_parser() -> argparse.ArgumentParser:
             leaf.add_argument(
                 "--keep", type=int, default=backup_module.DEFAULT_KEEP, help="archives to keep"
             )
+    caddy = apply_targets.add_parser("caddy", help="configure a Caddy reverse proxy")
+    _add_global_flags(caddy, suppress=True)
+    caddy.add_argument("--site", required=True, metavar="HOSTNAME", help="public site hostname")
+    caddy.add_argument(
+        "--upstream", required=True, metavar="ADDRESS", help="reverse proxy upstream"
+    )
     all_parser = apply_targets.add_parser(
         "all",
         help=(
             "apply every non-interactive module in DESIGN.md order "
             "(updates, ssh, firewall, fail2ban, sysctl, sandbox, logging, audit, "
             "alert, backup); cleanup-services is excluded because it is interactive; "
-            "ssh is skipped unless --ssh-user and --key are given"
+            "ssh is skipped unless --ssh-user and --key are given; Caddy is applied separately"
         ),
     )
     _add_global_flags(all_parser, suppress=True)
@@ -278,26 +309,20 @@ def _sysctl_targets() -> dict[str, str]:
 SYSCTL_TARGETS = _sysctl_targets()
 
 
-def _query_system() -> QueryTable:
-    release: dict[str, str] = {}
-    try:
-        for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
-            if "=" in line:
-                key, _, value = line.partition("=")
-                release[key] = value.strip().strip('"')
-    except OSError:
-        pass
-    info = {
-        "hostname": socket.gethostname(),
-        "distro": release.get("PRETTY_NAME", "unknown"),
-        "kernel": platform.release(),
-        "arch": platform.machine(),
-        "python": platform.python_version(),
-        "user": os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown",
-        "root": is_root(),
-    }
-    rows = [[key, str(value)] for key, value in info.items()]
-    return ["key", "value"], rows, info, []
+def _query_system(runner: Runner, *, public_ip: bool) -> QueryTable:
+    from lhm.modules.system import query
+
+    return query(runner, public_ip=public_ip)
+
+
+def _query_caddy(runner: Runner) -> QueryTable:
+    from lhm.modules.caddy import inspect
+
+    state = inspect(runner)
+    rows = [
+        [key, str(value) if value is not None else "unavailable"] for key, value in state.items()
+    ]
+    return ["key", "value"], rows, state, []
 
 
 def _query_ssh(runner: Runner) -> QueryTable:
@@ -369,29 +394,46 @@ def _query_firewall(
     runner: Runner,
 ) -> QueryTable:
     status = checks.ufw_status(runner)
+    ingress = list(firewall_module.caddy_ingress(runner))
+    ingress_row = [
+        "managed Caddy ingress",
+        ", ".join(ingress) or "not verified; no automatic rules",
+    ]
+    retention_note = "existing rules remain if Caddy is removed"
+    retention = ["ingress retention", retention_note]
     if status is None:
-        payload: dict[str, Any] = {"available": False, "note": "not configured by lhm"}
-        return ["key", "value"], [["status", "unavailable"]], payload, [[None, Color.YELLOW]]
+        payload: dict[str, Any] = {
+            "available": False,
+            "note": "not configured by lhm",
+            "caddy_ingress": ingress,
+            "caddy_ingress_retention": retention_note,
+        }
+        return (
+            ["key", "value"],
+            [["status", "unavailable"], ingress_row, retention],
+            payload,
+            [[None, Color.YELLOW], None, None],
+        )
     payload = {
         "available": True,
         "active": status.active,
         "default_incoming": status.default_incoming,
         "default_outgoing": status.default_outgoing,
         "rules": [[rule.to, rule.action, rule.source] for rule in status.rules],
+        "caddy_ingress": ingress,
+        "caddy_ingress_retention": retention_note,
     }
     rows = [
-        ["active", str(status.active)],
-        ["default incoming", status.default_incoming or "-"],
-        ["default outgoing", status.default_outgoing or "-"],
+        ["active (reported by UFW)", str(status.active)],
+        ["configured default incoming", status.default_incoming or "-"],
+        ["configured default outgoing", status.default_outgoing or "-"],
     ]
-    row_colors: list[RowColor] = [
-        [None, Color.GREEN if status.active else Color.RED],
-        [None, Color.GREEN if status.default_incoming == "deny" else Color.RED],
-        None,
-    ]
+    row_colors: list[RowColor] = [None, None, None]
     for rule in status.rules:
-        rows.append([f"rule {rule.to}", f"{rule.action} from {rule.source or 'anywhere'}"])
+        rows.append([f"saved rule {rule.to}", f"{rule.action} from {rule.source or 'anywhere'}"])
         row_colors.append(None)
+    rows.extend([ingress_row, retention])
+    row_colors.extend([None, None])
     return ["key", "value"], rows, payload, row_colors
 
 
@@ -399,6 +441,9 @@ def _query_fail2ban(runner: Runner) -> QueryTable:
     state = fail2ban_module.inspect(runner)
     installed = state["installed"]
     caddy_enabled = state["caddy_enabled"]
+    caddy_mode = state["caddy_mode"]
+    caddy_jail = state["caddy_jail"]
+    caddy_live = state["caddy_jail_live"]
     payload: dict[str, Any] = {
         "installed": installed,
         "active": state["active"],
@@ -407,6 +452,9 @@ def _query_fail2ban(runner: Runner) -> QueryTable:
         "caddy_filter": state["caddy_filter"],
         "caddy_filter_present": state["caddy_filter_present"],
         "caddy_enabled": caddy_enabled,
+        "caddy_mode": caddy_mode,
+        "caddy_jail": caddy_jail,
+        "caddy_jail_live": caddy_live,
         "legacy_jail_local": state["legacy_jail_local"],
         "legacy_jail_local_present": state["legacy_jail_local_present"],
         "dbfile": state["dbfile"],
@@ -445,20 +493,25 @@ def _query_fail2ban(runner: Runner) -> QueryTable:
     row_colors.append([None, _judge(increment)])
     payload["sshd_bantime_increment"] = increment
 
+    if isinstance(caddy_mode, str):
+        rows.append(["caddy mode", caddy_mode])
+        row_colors.append(None)
     if caddy_enabled is None:
-        rows.append(["caddy jail", "not configured"])
+        rows.append(["caddy jail", "not configured by lhm"])
         row_colors.append(None)
     else:
         rows.append(["caddy jail enabled", _flag(caddy_enabled)])
         row_colors.append([None, Color.GREEN if caddy_enabled else None])
         if caddy_enabled:
             filter_ok = bool(state["caddy_filter_present"])
-            rows.append(["caddy-lhm filter", "present" if filter_ok else "missing"])
+            rows.append(["caddy filter", "present" if filter_ok else "missing"])
             row_colors.append([None, _judge(filter_ok)])
-            caddy_status = runner.run(["fail2ban-client", "status", "caddy"], check=False)
-            caddy_live = caddy_status.ok and "caddy" in caddy_status.stdout
-            rows.append(["caddy jail live", _flag(caddy_live)])
-            row_colors.append([None, _judge(caddy_live)])
+            if isinstance(caddy_jail, str):
+                rows.append(["caddy jail", caddy_jail])
+                row_colors.append(None)
+            live = caddy_live if isinstance(caddy_live, bool) else None
+            rows.append(["caddy jail live", _flag(live)])
+            row_colors.append([None, _judge(live)])
     if state["legacy_jail_local_present"]:
         rows.append(["legacy jail.local", "present (preserved, overridden by the drop-in)"])
         row_colors.append(None)
@@ -566,19 +619,23 @@ def _query_updates(
         )
     active = checks.probe_service(runner, updates_module.PACKAGE).active
     installed = payload["installed"]
-    conf_current = bool(payload["apt_conf_current"])
+    current = payload["apt_conf_current"]
+    conf_current = current if isinstance(current, bool) else None
     rows = [
         ["unattended-upgrades installed", _flag(installed)],
         ["unattended-upgrades active", _flag(active)],
-        ["51-lhm current", "yes" if conf_current else "no"],
+        ["effective security policy verified", _flag(conf_current)],
         ["51-lhm path", str(payload["apt_conf"])],
     ]
     row_colors: list[RowColor] = [
         [None, _judge(None if installed is None else bool(installed))],
         [None, _judge(active)],
-        [None, Color.GREEN if conf_current else Color.RED],
+        [None, _judge(conf_current)],
         None,
     ]
+    if conf_current is None and "apt_policy_error" in payload:
+        rows.append(["reason", str(payload["apt_policy_error"])])
+        row_colors.append(None)
     return ["key", "value"], rows, payload, row_colors
 
 
@@ -586,7 +643,7 @@ def _handle_query(args: argparse.Namespace, runner: Runner, as_json: bool) -> in
     builders: dict[
         str, Callable[[], QueryTable]
     ] = {
-        "system": _query_system,
+        "system": lambda: _query_system(runner, public_ip=getattr(args, "public_ip", False)),
         "ssh": lambda: _query_ssh(runner),
         "firewall": lambda: _query_firewall(runner),
         "fail2ban": lambda: _query_fail2ban(runner),
@@ -595,6 +652,7 @@ def _handle_query(args: argparse.Namespace, runner: Runner, as_json: bool) -> in
         "sysctl": _query_sysctl,
         "audit": lambda: _query_audit(runner),
         "updates": lambda: _query_updates(runner),
+        "caddy": lambda: _query_caddy(runner),
     }
     if args.target == "all":
         return _query_all(runner, builders, as_json)
@@ -629,17 +687,26 @@ def _query_all(
     return EXIT_OK
 
 
-def _check_updates(runner: Runner) -> tuple[bool, str]:
+def _check_updates(runner: Runner) -> tuple[bool | None, str]:
     try:
         state = updates_module.inspect(runner)
     except DistroError as exc:
-        return False, f"cannot probe: {exc}"
-    problems = []
-    if not state["installed"]:
+        return None, f"cannot probe: {exc}"
+    problems: list[str] = []
+    unknown: list[str] = []
+    if state["installed"] is False:
         problems.append("package missing")
-    if not state["apt_conf_current"]:
-        problems.append("51-lhm content differs")
-    return not problems, ", ".join(problems) if problems else "security-only unattended upgrades"
+    elif state["installed"] is None:
+        unknown.append("package status unverified")
+    if state["apt_conf_current"] is None:
+        unknown.append(str(state.get("apt_policy_error", "security policy unverified")))
+    elif state["apt_conf_current"] is False:
+        problems.append(str(state.get("apt_policy_error", "effective security policy differs")))
+    if problems:
+        return False, ", ".join(problems)
+    if unknown:
+        return None, ", ".join(unknown)
+    return True, "security-only unattended upgrades"
 
 
 def _check_ssh(runner: Runner) -> tuple[bool, str]:
@@ -800,17 +867,36 @@ def _handle_check(args: argparse.Namespace, runner: Runner, as_json: bool) -> in
                 row_colors.append([None, Color.YELLOW])
             continue
         ok, detail = checker(runner)
-        rows.append([module.name, "OK" if ok else "needs-change", detail])
-        row_colors.append([None, Color.GREEN if ok else Color.RED])
+        state = "UNKNOWN" if ok is None else "OK" if ok else "needs-change"
+        rows.append([module.name, state, detail])
+        row_colors.append([None, _judge(ok)])
     if as_json:
         print_json([{"area": a, "state": s, "detail": d} for a, s, d in rows])
     else:
         print_table(["area", "state", "detail"], rows, row_colors=row_colors)
-    return EXIT_OK
+    return EXIT_FAIL if any(state == "UNKNOWN" for _, state, _ in rows) else EXIT_OK
 
 
 def _managed_rollback_path(value: str) -> Path:
+    from lhm.modules import caddy
+
     path = Path(value)
+    if path in {caddy.CADDYFILE, caddy.INSTALL_HOLD}:
+        raise ValueError(
+            "managed Caddy files require lifecycle recovery; "
+            "use lhm query caddy and lhm apply caddy --site HOSTNAME --upstream ADDRESS"
+        )
+    if path in {
+        fail2ban_module.JAIL_DROPIN,
+        fail2ban_module.CADDY_FILTER,
+        fail2ban_module.CADDY_ACCESS_FILTER,
+    }:
+        raise ValueError(
+            "managed Fail2ban files require lifecycle recovery; "
+            "inspect with lhm query fail2ban, then rerun lhm apply fail2ban "
+            "with the original settings. Use --caddy-revoke-direct only to intentionally "
+            "remove the direct file jail."
+        )
     managed = {
         alert_module.SCRIPT,
         alert_module.SERVICE_UNIT,
@@ -819,8 +905,6 @@ def _managed_rollback_path(value: str) -> Path:
         backup_module.SCRIPT,
         backup_module.SERVICE_UNIT,
         backup_module.TIMER_UNIT,
-        fail2ban_module.JAIL_DROPIN,
-        fail2ban_module.CADDY_FILTER,
         logging_module.JOURNALD_DROPIN,
         logging_module.LOGROTATE_CONF,
         ssh_module.SSHD_DROPIN,
@@ -1053,6 +1137,8 @@ def _handle_apply(args: argparse.Namespace, runner: Runner, as_json: bool) -> in
         options["command"] = "ssh-hardening"
         options["port"] = args.port
         options["allow_users"] = list(args.allow_user)
+        if args.ssh_user is not None:
+            options["ssh_user"] = args.ssh_user
         name = "ssh"
     elif name == "cleanup-services":
         options["select"] = getattr(args, "select", "")
@@ -1067,6 +1153,9 @@ def _handle_apply(args: argparse.Namespace, runner: Runner, as_json: bool) -> in
         options["maxretry"] = args.maxretry
         options["caddy"] = bool(args.caddy)
         options["caddy_maxretry"] = args.caddy_maxretry
+        options["caddy_direct"] = args.caddy_direct
+        options["caddy_protected_paths"] = tuple(args.caddy_protected_path)
+        options["caddy_revoke_direct"] = args.caddy_revoke_direct
     elif name == "sandbox":
         options["services"] = list(args.services)
     elif name == "alert":
@@ -1074,12 +1163,23 @@ def _handle_apply(args: argparse.Namespace, runner: Runner, as_json: bool) -> in
     elif name == "backup":
         options["target"] = args.target
         options["keep"] = args.keep
+    elif name == "caddy":
+        options["site"] = args.site
+        options["upstream"] = args.upstream
     return _run_module(name, runner, as_json, **options)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "public_ip", False) and args.dry_run:
+        parser.error("--public-ip cannot be used with --dry-run")
+    if (
+        args.command == "apply"
+        and args.module == "fail2ban"
+        and args.caddy_direct != bool(args.caddy_protected_path)
+    ):
+        parser.error("--caddy-direct and --caddy-protected-path must be used together")
     as_json = bool(args.json)
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
